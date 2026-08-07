@@ -114,6 +114,48 @@ async def test_concurrent_reads_never_see_partial_content(dsn):
         await provider.close()
 
 
+async def test_range_read_uses_one_snapshot_for_metadata_and_chunks(dsn, monkeypatch):
+    """An overwrite between resolution and content fetch cannot mix versions.
+
+    The old and new versions deliberately use different chunk sizes. With
+    separate metadata and chunk snapshots, range 4:8 was assembled as
+    ``b"YYYY"``: new chunk 1 interpreted using the old four-byte chunk size.
+    """
+    old_content = b"AAAABBBBCCCC"
+    new_content = b"xxxxxxYYYYYY"
+    old_writer = PostgresStorageProvider(dsn=dsn, chunk_size=4)
+    new_writer = PostgresStorageProvider(dsn=dsn, chunk_size=6)
+    assert await old_writer.initialize()
+    assert await new_writer.initialize()
+    try:
+        await _mkfile(old_writer, "/snapshot.bin")
+        assert await old_writer.write_file("/snapshot.bin", old_content)
+
+        resolved = asyncio.Event()
+        resume = asyncio.Event()
+        original_resolve = old_writer._resolve
+
+        async def _pause_after_resolution(conn, path):
+            row = await original_resolve(conn, path)
+            resolved.set()
+            await resume.wait()
+            return row
+
+        monkeypatch.setattr(old_writer, "_resolve", _pause_after_resolution)
+
+        read = asyncio.create_task(old_writer.read_range("/snapshot.bin", 4, 8))
+        await asyncio.wait_for(resolved.wait(), timeout=2)
+        assert await new_writer.write_file("/snapshot.bin", new_content)
+        resume.set()
+
+        result = await asyncio.wait_for(read, timeout=2)
+        assert result in {old_content[4:8], new_content[4:8]}
+        assert result != b"YYYY"
+    finally:
+        await old_writer.close()
+        await new_writer.close()
+
+
 async def test_concurrent_duplicate_creates_single_node(dsn):
     """The (parent_id, name) unique index guarantees exactly one node even
     when many sessions create the same path at once."""

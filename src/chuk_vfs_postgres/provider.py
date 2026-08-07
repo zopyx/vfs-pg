@@ -558,14 +558,28 @@ class PostgresStorageProvider(AsyncStorageProvider):
         path = self._normalize(path)
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
-            if row is None or row["is_dir"]:
+            if row is None:
                 return None
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT data FROM vfs_chunks WHERE node_id = %s ORDER BY chunk_no",
+                    """
+                    SELECT n.is_dir, n.size, n.chunk_size, c.chunk_no, c.data
+                      FROM vfs_nodes n
+                      LEFT JOIN vfs_chunks c ON c.node_id = n.node_id
+                     WHERE n.node_id = %s
+                     ORDER BY c.chunk_no
+                    """,
                     (row["node_id"],),
                 )
-                return b"".join(r[0] for r in await cur.fetchall())
+                parts = await cur.fetchall()
+
+            # Resolution only supplies the stable node id. File metadata and
+            # chunks come from the same statement snapshot, so an overwrite
+            # cannot combine one version's metadata with another's chunks.
+            if not parts or parts[0][0]:
+                return None
+            size = parts[0][1]
+            return b"".join(part[4] for part in parts if part[4] is not None)[:size]
 
     async def read_range(self, path: str, start: int, end: int) -> bytes | None:
         """Chunk-aware range read: only fetches overlapping chunks.
@@ -583,32 +597,57 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
-            if row is None or row["is_dir"]:
+            if row is None:
                 return None
-
-            size = row["size"]
-            chunk_size = row["chunk_size"] or self.chunk_size
-            if start >= size:
-                return b""
-            if end is None or end > size:
-                end = size
-
-            first = start // chunk_size
-            last = (end - 1) // chunk_size
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT chunk_no, data FROM vfs_chunks
-                     WHERE node_id = %s AND chunk_no BETWEEN %s AND %s
-                     ORDER BY chunk_no
+                    WITH target AS (
+                        SELECT node_id,
+                               is_dir,
+                               size,
+                               COALESCE(NULLIF(chunk_size, 0), %s) AS chunk_size,
+                               %s::bigint AS range_start,
+                               LEAST(COALESCE(%s::bigint, size), size) AS range_end
+                          FROM vfs_nodes
+                         WHERE node_id = %s
+                    )
+                    SELECT target.is_dir,
+                           target.size,
+                           target.chunk_size,
+                           target.range_start,
+                           target.range_end,
+                           c.chunk_no,
+                           c.data
+                      FROM target
+                      LEFT JOIN vfs_chunks c
+                        ON c.node_id = target.node_id
+                       AND target.range_start < target.range_end
+                       AND c.chunk_no BETWEEN
+                           target.range_start / target.chunk_size
+                           AND (target.range_end - 1) / target.chunk_size
+                     ORDER BY c.chunk_no
                     """,
-                    (row["node_id"], first, last),
+                    (self.chunk_size, start, end, row["node_id"]),
                 )
                 parts = await cur.fetchall()
 
-            data = b"".join(p[1] for p in parts)
-            offset = start - first * chunk_size
-            return data[offset : offset + (end - start)]
+            # The node may have been removed after path resolution. Otherwise
+            # the LEFT JOIN guarantees one row even for directories, empty
+            # files, and ranges at/past EOF.
+            if not parts or parts[0][0]:
+                return None
+
+            chunk_size = parts[0][2]
+            range_start = parts[0][3]
+            range_end = parts[0][4]
+            if range_start >= range_end:
+                return b""
+
+            data = b"".join(part[6] for part in parts if part[6] is not None)
+            first = range_start // chunk_size
+            offset = range_start - first * chunk_size
+            return data[offset : offset + (range_end - range_start)]
 
     async def exists(self, path: str) -> bool:
         """True when the path resolves to a node."""
