@@ -182,7 +182,11 @@ Acceptance criteria:
 
 ## P2 — Stress test and observability improvements
 
-### [ ] Make the stress test validate data, not only lengths
+### [x] Add a data-validating heavy stress test
+
+Implemented as `examples/heavy_stress.py` with a five-minute mixed small/large
+workload, bounded overwrite slots, exact full/range verification, and regular
+activity reports.
 
 - Store enough deterministic generation information to verify random range bytes.
 - Do not hold `registry_lock` while sleeping.

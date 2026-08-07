@@ -116,13 +116,29 @@ open docs/_build/html/index.html
 ## Examples
 
 ```bash
-uv run python examples/demo.py     # 256 MiB store/read demo with throughput
-uv run python examples/stress.py   # 60 s multi-reader/writer stress test
+uv run python examples/demo.py          # 256 MiB store/read demo with throughput
+uv run python examples/stress.py        # 60 s multi-reader/writer stress test
+uv run python examples/heavy_stress.py  # 5 min mixed small/large-file stress test
 ```
 
 `demo.py` and `stress.py` accept `VFS_PG_DSN`; `stress.py` also
 `VFS_STRESS_SECONDS` / `VFS_STRESS_WRITERS` / `VFS_STRESS_READERS` /
 `VFS_STRESS_MIN_MB` / `VFS_STRESS_MAX_MB`.
+
+`heavy_stress.py` defaults to four 1–256 KiB writers, two 16–64 MiB writers,
+and eight full/range readers for 300 seconds. It reports interval and cumulative
+throughput, operation counts, errors, latency percentiles, exception types, and
+PostgreSQL storage statistics every ten seconds. Content is deterministic: full
+reads verify SHA-256 and range reads verify the exact returned bytes. Writers
+reuse a fixed set of slots to bound storage growth, and run data is removed on
+exit unless `--keep-data` is supplied. Run `--help` for all CLI and environment
+controls. A quick smoke profile is:
+
+```bash
+uv run python examples/heavy_stress.py --duration 10 --report-interval 2 \
+  --small-writers 1 --large-writers 1 --readers 2 \
+  --large-min-mib 1 --large-max-mib 2
+```
 
 ## Testing
 
@@ -148,7 +164,7 @@ regression coverage).
 ```
 src/chuk_vfs_postgres/   the PostgreSQL storage provider
 src/chuk_fsspec/         the fsspec adapter (chuk://, provider-agnostic)
-examples/                demo.py (256 MiB demo) + stress.py (60 s stress)
+examples/                demos plus 60 s and five-minute stress harnesses
 tests/                   pytest suite (testcontainers fixtures)
 docs/                    Sphinx documentation
 tasks.md                 improvement backlog with acceptance criteria

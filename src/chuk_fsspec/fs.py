@@ -18,12 +18,15 @@ Sync users get the plain fsspec API; internals are async (psycopg pool).
 
 from __future__ import annotations
 
+import os
 import posixpath
 from typing import Any
 
 from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 from fsspec.asyn import AsyncFileSystem, sync_wrapper
+from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.spec import AbstractBufferedFile
+from fsspec.utils import isfilelike
 
 DEFAULT_BLOCK_SIZE = 5 * 1024 * 1024  # 5 MiB
 
@@ -200,6 +203,80 @@ class ChukFileSystem(AsyncFileSystem):
         if start is None and end is None:
             return data
         return data[start:end]
+
+    async def _get_file(
+        self,
+        rpath: str,
+        lpath: Any,
+        chunk_size: int = DEFAULT_BLOCK_SIZE,
+        callback: Any = DEFAULT_CALLBACK,
+        **kwargs: Any,
+    ) -> None:
+        """Export one VFS entry to a local path or writable file object."""
+        info = await self._info(rpath)
+        if info["type"] == "directory":
+            if isfilelike(lpath):
+                raise IsADirectoryError(rpath)
+            os.makedirs(lpath, exist_ok=True)
+            return
+
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+
+        size = info["size"]
+        callback.set_size(size)
+
+        async def export_to(output: Any) -> None:
+            def write_block(data: bytes) -> None:
+                written = output.write(data)
+                if written is not None and written != len(data):
+                    raise OSError(
+                        f"short local write for {rpath}: "
+                        f"expected {len(data)}, wrote {written}"
+                    )
+                callback.relative_update(len(data))
+
+            provider, local = self.vfs._get_provider_for_path(rpath)
+            ranger = getattr(provider, "read_range", None)
+            if ranger is None:
+                # Generic chuk providers may not expose range reads. Read once
+                # rather than reloading the complete file for every output block.
+                data = await self.vfs.read_binary(rpath)
+                if data is None:
+                    raise FileNotFoundError(rpath)
+                if len(data) != size:
+                    raise OSError(
+                        f"source changed while exporting {rpath}: "
+                        f"expected {size} bytes, read {len(data)}"
+                    )
+                write_block(data)
+                return
+
+            offset = 0
+            while offset < size:
+                end = min(offset + chunk_size, size)
+                data = await ranger(local, offset, end)
+                if data is None:
+                    raise FileNotFoundError(rpath)
+                expected = end - offset
+                if len(data) != expected:
+                    raise OSError(
+                        f"short source read for {rpath}: "
+                        f"expected {expected} bytes, read {len(data)}"
+                    )
+                write_block(data)
+                offset = end
+
+        if isfilelike(lpath):
+            await export_to(lpath)
+            return
+
+        local_path = os.fspath(lpath)
+        parent = os.path.dirname(local_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(local_path, "wb") as output:  # noqa: ASYNC230
+            await export_to(output)
 
     async def _pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
         ok = await self._commit(path, value, exclusive=False)

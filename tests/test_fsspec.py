@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
+import os
 import random
+import tempfile
 
 import fsspec
 import pytest
@@ -16,6 +19,7 @@ from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 from fsspec.asyn import get_loop
 
 from chuk_fsspec import ChukFileSystem
+from chuk_fsspec.fs import ChukBufferedFile
 
 # register once so `fsspec.filesystem("chuk", ...)` / `fsspec.open("chuk://...")` work
 fsspec.register_implementation("chuk", ChukFileSystem)
@@ -38,6 +42,33 @@ def fs(dsn: str):
     chuk_fs = ChukFileSystem(vfs)  # self.loop == the same fsspec IO loop
     yield chuk_fs
     asyncio.run_coroutine_threadsafe(vfs.close(), loop).result(timeout=30)
+
+
+def _tree_manifest(filesystem, root: str) -> dict[str, tuple[str, int | None, str | None]]:
+    """Describe a tree using portable structure and content attributes."""
+    root_normalized = filesystem._strip_protocol(str(root)).replace("\\", "/").rstrip("/")
+    details = filesystem.find(root, withdirs=True, detail=True)
+    manifest: dict[str, tuple[str, int | None, str | None]] = {}
+
+    for path, info in details.items():
+        normalized = filesystem._strip_protocol(str(path)).replace("\\", "/").rstrip("/")
+        assert normalized == root_normalized or normalized.startswith(f"{root_normalized}/")
+        relative = "." if normalized == root_normalized else normalized[len(root_normalized) + 1 :]
+        entry_type = info["type"]
+        if entry_type == "directory":
+            manifest[relative] = (entry_type, None, None)
+            continue
+
+        digest = hashlib.sha256()
+        size = 0
+        with filesystem.open(path, "rb") as handle:
+            while block := handle.read(256 * 1024):
+                digest.update(block)
+                size += len(block)
+        assert size == info["size"]
+        manifest[relative] = (entry_type, size, digest.hexdigest())
+
+    return manifest
 
 
 # ----------------------------------------------------------------------
@@ -307,3 +338,362 @@ def test_entry_point_registered():
     matches = [ep for ep in entry_points(group="fsspec.specs") if ep.name == "chuk"]
     assert matches, "no fsspec.specs entry point for chuk"
     assert matches[0].value == "chuk_fsspec:ChukFileSystem"
+
+
+# ----------------------------------------------------------------------
+# recursive export to a local filesystem
+# ----------------------------------------------------------------------
+
+
+def test_recursive_get_exports_complex_tree_in_sync(fs, tmp_path):
+    source_root = "/export-source"
+    fs.mkdir(f"{source_root}/empty-dir/nested-empty")
+
+    files = {
+        ".hidden": b"hidden\n",
+        "README.txt": "Grüße from PostgreSQL\n".encode(),
+        "empty.bin": b"",
+        "spaces/hello world.txt": b"paths with spaces\n",
+        "unicode/Grüße 東京.txt": "Unicode payload: ☃\n".encode(),
+        "nested/a/b/config.json": b'{"enabled": true, "items": [1, 2, 3]}\n',
+        "binary/payload.bin": random.Random(20260807).randbytes(2 * CHUNK + 123),
+    }
+    for relative, content in files.items():
+        fs.pipe_file(f"{source_root}/{relative}", content)
+
+    expected_paths = {
+        ".",
+        ".hidden",
+        "README.txt",
+        "binary",
+        "binary/payload.bin",
+        "empty-dir",
+        "empty-dir/nested-empty",
+        "empty.bin",
+        "nested",
+        "nested/a",
+        "nested/a/b",
+        "nested/a/b/config.json",
+        "spaces",
+        "spaces/hello world.txt",
+        "unicode",
+        "unicode/Grüße 東京.txt",
+    }
+
+    destination = tmp_path / "exported"
+    fs.get(source_root, str(destination), recursive=True, chunk_size=CHUNK // 2)
+
+    local_fs = fsspec.filesystem("file")
+    postgres_manifest = _tree_manifest(fs, source_root)
+    local_manifest = _tree_manifest(local_fs, str(destination))
+
+    assert set(postgres_manifest) == expected_paths
+    assert local_manifest == postgres_manifest
+
+
+def test_get_file_supports_writable_file_object(fs):
+    content = b"streamed into an in-memory destination"
+    fs.pipe_file("/download.bin", content)
+    destination = io.BytesIO()
+
+    fs.get_file("/download.bin", destination, chunk_size=7)
+
+    assert destination.closed is False
+    assert destination.getvalue() == content
+
+
+# ----------------------------------------------------------------------
+# coverage: constructor, tree ops, edge cases
+# ----------------------------------------------------------------------
+
+
+def test_fs_constructor_rejects_none_vfs():
+    with pytest.raises(ValueError, match="requires a chuk"):
+        ChukFileSystem(vfs=None)
+
+
+def test_mkdir_root_is_noop(fs):
+    assert fs.mkdir("/") is True
+
+
+def test_mv_source_missing_raises(fs):
+    with pytest.raises(FileNotFoundError):
+        fs.mv("/no/such/file", "/dst.txt")
+
+
+def test_get_file_dir_to_filelike_raises(fs):
+    fs.mkdir("/mydir")
+    dest = io.BytesIO()
+    with pytest.raises(IsADirectoryError):
+        fs.get_file("/mydir", dest)
+
+
+def test_get_file_chunk_size_zero_raises(fs):
+    fs.pipe_file("/f.bin", b"data")
+    with pytest.raises(ValueError, match="chunk_size must be greater"):
+        fs.get_file("/f.bin", "/dev/null", chunk_size=0)
+
+
+# ----------------------------------------------------------------------
+# coverage: mocked / internal paths
+# ----------------------------------------------------------------------
+
+
+def _run_async(fs, coro, timeout=10):
+    loop = get_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+
+
+# _mv (fsspec mv() does copy+rm, not _mv)
+def test_mv_direct_success_and_source_missing(fs):
+    fs.pipe_file("/s.txt", b"data")
+    assert _run_async(fs, fs._mv("/s.txt", "/d.txt")) is True
+    assert not fs.exists("/s.txt")
+    assert fs.cat_file("/d.txt") == b"data"
+    with pytest.raises(FileNotFoundError):
+        _run_async(fs, fs._mv("/no/such", "/dst.txt"))
+
+
+# _cat_file: ranger returns None
+def test_cat_file_ranger_returns_none(fs):
+    fs.pipe_file("/f.bin", b"hello")
+    provider, _local = fs.vfs._get_provider_for_path("/f.bin")
+    orig = provider.read_range
+
+    async def _none(*args, **kwargs):
+        return None
+
+    provider.read_range = _none
+    try:
+        with pytest.raises(FileNotFoundError):
+            fs.cat_file("/f.bin", start=0, end=5)
+    finally:
+        provider.read_range = orig
+
+
+# _cat_file: no ranger + slice
+def test_cat_file_no_ranger_slice(fs):
+    fs.pipe_file("/f.bin", b"0123456789")
+    provider, _local = fs.vfs._get_provider_for_path("/f.bin")
+    saved = provider.read_range
+    provider.read_range = None
+    try:
+        assert fs.cat_file("/f.bin", start=2, end=7) == b"23456"
+    finally:
+        provider.read_range = saved
+
+
+# _get_file: short local write
+class _ShortWriter(io.RawIOBase):
+    def write(self, b):
+        return max(0, len(b) - 1)
+
+
+def test_get_file_short_local_write_raises(fs):
+    fs.pipe_file("/f.bin", b"hello world")
+    dest = _ShortWriter()
+    with pytest.raises(OSError, match="short local write"):
+        fs.get_file("/f.bin", dest, chunk_size=64 * 1024)
+
+
+# _get_file: no ranger fallback (file path)
+def test_get_file_no_ranger_fallback(fs):
+    rng = random.Random(42)
+    content = rng.randbytes(1024)
+    fs.pipe_file("/big.bin", content)
+    provider, _local = fs.vfs._get_provider_for_path("/big.bin")
+    saved = provider.read_range
+    provider.read_range = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            fs.get_file("/big.bin", tmp_path, chunk_size=256)
+            with open(tmp_path, "rb") as f:
+                assert f.read() == content
+        finally:
+            os.unlink(tmp_path)
+    finally:
+        provider.read_range = saved
+
+
+# _get_file: no ranger + file-like
+def test_get_file_no_ranger_filelike(fs):
+    content = b"no-ranger filelike test"
+    fs.pipe_file("/nr.bin", content)
+    provider, _local = fs.vfs._get_provider_for_path("/nr.bin")
+    saved = provider.read_range
+    provider.read_range = None
+    try:
+        dest = io.BytesIO()
+        fs.get_file("/nr.bin", dest, chunk_size=64 * 1024)
+        assert dest.getvalue() == content
+    finally:
+        provider.read_range = saved
+
+
+# _get_file: ranger returns None mid-stream
+def test_get_file_ranger_returns_none_midstream(fs):
+    content = random.Random(7).randbytes(3 * 1024 * 1024)
+    fs.pipe_file("/mid.bin", content)
+    provider, _local = fs.vfs._get_provider_for_path("/mid.bin")
+    orig = provider.read_range
+    call_count = [0]
+
+    async def _fail_second(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            return None
+        return await orig(*args, **kwargs)
+
+    provider.read_range = _fail_second
+    try:
+        with pytest.raises(FileNotFoundError):
+            fs.get_file("/mid.bin", io.BytesIO(), chunk_size=1024 * 1024)
+    finally:
+        provider.read_range = orig
+
+
+# _get_file: short source read
+def test_get_file_short_source_read_raises(fs):
+    fs.pipe_file("/short.bin", b"x" * 2000)
+    provider, _local = fs.vfs._get_provider_for_path("/short.bin")
+    orig = provider.read_range
+
+    async def _short(*args, **kwargs):
+        return b"short"
+
+    provider.read_range = _short
+    try:
+        with pytest.raises(OSError, match="short source read"):
+            fs.get_file("/short.bin", io.BytesIO(), chunk_size=100)
+    finally:
+        provider.read_range = orig
+
+
+# _commit: generic fallback (no write_file_atomic)
+def test_commit_generic_fallback_success(fs):
+    provider, _local = fs.vfs._get_provider_for_path("/")
+    saved = provider.write_file_atomic
+    provider.write_file_atomic = None
+    try:
+        fs.pipe_file("/gen.txt", b"generic")
+        assert fs.cat_file("/gen.txt") == b"generic"
+    finally:
+        provider.write_file_atomic = saved
+
+
+# _pipe_file: commit fails
+def test_pipe_file_commit_fails(fs):
+    fs.pipe_file("/pf.bin", b"old")
+    provider, _local = fs.vfs._get_provider_for_path("/pf.bin")
+    orig = provider.write_file_atomic
+
+    async def _fail(path, content, *, exclusive=False):
+        return 0
+
+    provider.write_file_atomic = _fail
+    try:
+        with pytest.raises(OSError, match="write failed"):
+            fs.pipe_file("/pf.bin", b"new")
+    finally:
+        provider.write_file_atomic = orig
+
+
+# ChukBufferedFile._upload_chunk: OSError on non-x write failure
+def test_upload_chunk_write_failure_raises_oserror(fs):
+    bf = ChukBufferedFile(fs, "/wb_fail.bin", mode="wb")
+    bf.buffer.write(b"data")
+    orig = fs.commit
+
+    def _fail_commit(path, content, *, exclusive=False):
+        return False
+
+    fs.commit = _fail_commit
+    try:
+        with pytest.raises(OSError, match="write failed"):
+            bf._upload_chunk(final=True)
+    finally:
+        fs.commit = orig
+
+
+# _mkdir failure
+def test_mkdir_vfs_failure_returns_false(fs):
+    orig = fs.vfs.mkdir
+
+    async def _fail_mkdir(path):
+        if path == "/fail-dir":
+            return False
+        return await orig(path)
+
+    fs.vfs.mkdir = _fail_mkdir
+    try:
+        assert fs.mkdir("/fail-dir") is False
+    finally:
+        fs.vfs.mkdir = orig
+
+
+# _get_file: no-ranger path, read_binary returns None (line 246)
+def test_get_file_no_ranger_read_binary_none(fs):
+    fs.pipe_file("/nb.bin", b"data")
+    provider, _local = fs.vfs._get_provider_for_path("/nb.bin")
+    saved = provider.read_range
+    provider.read_range = None
+    orig_read = fs.vfs.read_binary
+
+    async def _none(path):
+        return None
+
+    fs.vfs.read_binary = _none
+    try:
+        with pytest.raises(FileNotFoundError):
+            fs.get_file("/nb.bin", io.BytesIO())
+    finally:
+        fs.vfs.read_binary = orig_read
+        provider.read_range = saved
+
+
+# _get_file: no-ranger path, size mismatch (line 248-249)
+def test_get_file_no_ranger_size_mismatch(fs):
+    fs.pipe_file("/sm.bin", b"hello world")
+    provider, _local = fs.vfs._get_provider_for_path("/sm.bin")
+    saved = provider.read_range
+    provider.read_range = None
+    orig_read = fs.vfs.read_binary
+
+    async def _wrong(path):
+        return b"short"
+
+    fs.vfs.read_binary = _wrong
+    try:
+        with pytest.raises(OSError, match="source changed"):
+            fs.get_file("/sm.bin", io.BytesIO())
+    finally:
+        fs.vfs.read_binary = orig_read
+        provider.read_range = saved
+
+
+# _commit: generic fallback, exclusive + exists (line 307-308)
+def test_commit_generic_exclusive_exists(fs):
+    fs.pipe_file("/ex.txt", b"old")
+    provider, _local = fs.vfs._get_provider_for_path("/")
+    saved = provider.write_file_atomic
+    provider.write_file_atomic = None
+    try:
+        with pytest.raises(FileExistsError):
+            fs.open("/ex.txt", "xb")
+    finally:
+        provider.write_file_atomic = saved
+
+
+# _commit generic fallback: direct exclusive=True call (line 308)
+def test_commit_generic_exclusive_direct(fs):
+    fs.pipe_file("/cex.txt", b"old")
+    provider, _local = fs.vfs._get_provider_for_path("/")
+    saved = provider.write_file_atomic
+    provider.write_file_atomic = None
+    try:
+        result = _run_async(fs, fs._commit("/cex.txt", b"new", exclusive=True))
+        assert result is False
+    finally:
+        provider.write_file_atomic = saved

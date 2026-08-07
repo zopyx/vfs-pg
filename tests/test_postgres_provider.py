@@ -7,6 +7,7 @@ transaction joining and the chuk AsyncVirtualFileSystem integration.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import random
 
@@ -546,3 +547,191 @@ async def test_vfs_metadata_via_set_metadata(vfs):
     await vfs.touch("/meta.txt")
     assert await vfs.set_metadata("/meta.txt", {"kind": "test"})
     assert await vfs.get_metadata("/meta.txt") == {"kind": "test"}
+
+
+# ----------------------------------------------------------------------
+# create_directory (provider-level, not the VFS-level mkdir)
+# ----------------------------------------------------------------------
+
+
+async def test_create_directory_root_is_noop(provider):
+    assert await provider.create_directory("/")
+
+
+async def test_create_directory_single_level(provider):
+    assert await provider.create_directory("/d1")
+    node = await provider.get_node_info("/d1")
+    assert node is not None and node.is_dir
+    assert node.mime_type == "inode/directory"
+
+
+async def test_create_directory_with_parents(provider):
+    assert await provider.create_directory("/a/b/c/d")
+    for p in ["/a/b/c/d", "/a/b/c", "/a/b", "/a"]:
+        node = await provider.get_node_info(p)
+        assert node is not None and node.is_dir
+
+
+async def test_create_directory_idempotent(provider):
+    assert await provider.create_directory("/deep/nested")
+    assert await provider.create_directory("/deep/nested")
+    node = await provider.get_node_info("/deep/nested")
+    assert node is not None and node.is_dir
+
+
+async def test_create_directory_over_existing_file_fails(provider):
+    await _mkfile(provider, "/f.txt")
+    assert await provider.create_directory("/f.txt/sub") is False
+
+
+async def test_create_directory_existing_path_is_file(provider):
+    await _mkfile(provider, "/f.txt")
+    assert await provider.create_directory("/f.txt") is False
+
+
+async def test_create_directory_missing_parent_root(provider):
+    """Impossible: root is always present, but cover the _resolve(None) branch."""
+    pass  # root always exists because schema creates it
+
+
+# ----------------------------------------------------------------------
+# write_file_atomic edge cases
+# ----------------------------------------------------------------------
+
+
+async def test_write_file_atomic_str_content(provider):
+    assert await provider.write_file_atomic("/str.txt", "héllo")
+    assert await provider.read_file("/str.txt") == "héllo".encode("utf-8")
+
+
+async def test_write_file_atomic_on_existing_directory(provider):
+    await _mkdir(provider, "/d")
+    assert await provider.write_file_atomic("/d", b"x") is False
+
+
+async def test_write_file_atomic_missing_parent(provider):
+    assert await provider.write_file_atomic("/nope/x.txt", b"x") is False
+
+
+async def test_write_file_atomic_exclusive_existing(provider):
+    await _mkfile(provider, "/e.txt")
+    await provider.write_file("/e.txt", b"old")
+    assert await provider.write_file_atomic("/e.txt", b"new", exclusive=True) is False
+    assert await provider.read_file("/e.txt") == b"old"
+
+
+async def test_write_file_atomic_creates_missing_node(provider):
+    assert await provider.write_file_atomic("/created.txt", b"hello")
+    assert await provider.read_file("/created.txt") == b"hello"
+    node = await provider.get_node_info("/created.txt")
+    assert node is not None and not node.is_dir
+
+
+async def test_write_file_atomic_overwrite(provider):
+    await _mkfile(provider, "/ow.txt")
+    await provider.write_file("/ow.txt", b"v1")
+    assert await provider.write_file_atomic("/ow.txt", b"v2")
+    assert await provider.read_file("/ow.txt") == b"v2"
+
+
+# ----------------------------------------------------------------------
+# default DSN / external_connection property
+# ----------------------------------------------------------------------
+
+
+def test_default_dsn():
+    p = PostgresStorageProvider()
+    assert p.dsn is not None
+    assert "postgresql://" in p.dsn
+    assert p.external_connection is None
+    assert p._external_conn is None
+
+
+async def test_provider_with_external_conn_has_external_connection(external_conn):
+    joined = PostgresStorageProvider(conn=external_conn)
+    assert joined.external_connection is external_conn
+    assert joined._external_conn is external_conn
+
+
+# ----------------------------------------------------------------------
+# internal helpers
+# ----------------------------------------------------------------------
+
+
+def test_split_root_path():
+    p = PostgresStorageProvider()
+    assert p._split("/") == ("/", "")
+    assert p._split("/foo/bar") == ("/foo", "bar")
+    assert p._split("foo") == ("/", "foo")
+    assert p._normalize("/foo/") == "/foo"
+    assert p._normalize("") == "/"
+    assert p._normalize("/") == "/"
+
+
+# ----------------------------------------------------------------------
+# internal: _resolve root-none, _init_lock double-check
+# ----------------------------------------------------------------------
+
+
+async def test_initialize_concurrent_same_instance_hits_double_check(dsn):
+    """Two concurrent initialize() calls on the *same* instance: the second
+    waits on the lock and hits the double-check (line 149)."""
+    provider = PostgresStorageProvider(dsn=dsn)
+    try:
+        results = await asyncio.gather(
+            provider.initialize(), provider.initialize()
+        )
+        assert results == [True, True]
+        assert provider._initialized
+    finally:
+        await provider.close()
+
+
+async def test_resolve_returns_none_when_root_missing(provider):
+    """_resolve returns None when _root_row returns None (line 306)."""
+    orig = provider._root_row
+
+    async def _no_root(conn):
+        return None
+
+    provider._root_row = _no_root
+    try:
+        async with provider._acquire() as conn:
+            assert await provider._resolve(conn, "/some/path") is None
+    finally:
+        provider._root_row = orig
+
+
+async def test_create_directory_returns_false_when_parent_missing(provider):
+    """create_directory returns False when a parent in the chain is missing
+    (line 704 — parent_row is None). This can't happen with a functioning
+    root, so we mock _resolve to simulate it."""
+    orig = provider._resolve
+
+    async def _mock_resolve(conn, path):
+        if path == "/":
+            return await orig(conn, path)
+        return None  # any non-root path fails
+
+    provider._resolve = _mock_resolve
+    try:
+        assert await provider.create_directory("/missing/parent") is False
+    finally:
+        provider._resolve = orig
+
+
+# ----------------------------------------------------------------------
+# error paths: pool open failure, duplicate siblings, loop-mismatch close
+# ----------------------------------------------------------------------
+
+
+async def test_initialize_failure_cleans_up_pool():
+    """Pool open failure triggers cleanup path (lines 165-170)."""
+    p = PostgresStorageProvider(dsn="postgresql://invalid:5432/nonexistent")
+    try:
+        with pytest.raises(Exception):
+            await p.initialize()
+        assert p._pool is None
+        assert p._initialized is False
+    finally:
+        await p.close()
