@@ -143,9 +143,7 @@ INSERT INTO vfs_nodes (filesystem_id, parent_id, name, is_dir)
 VALUES ('default', NULL, '', true)
 ON CONFLICT (filesystem_id) WHERE parent_id IS NULL DO NOTHING;
 """
-SCHEMA_SQL = (
-    SCHEMA_TABLES_SQL + INDEX_MIGRATION_SQL + SCHEMA_INDEXES_SQL + DEFAULT_ROOT_SQL
-)
+SCHEMA_SQL = SCHEMA_TABLES_SQL + INDEX_MIGRATION_SQL + SCHEMA_INDEXES_SQL + DEFAULT_ROOT_SQL
 
 # detects existing duplicate siblings before the unique index is installed
 DUPLICATE_SIBLINGS_SQL = """
@@ -493,9 +491,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
             raise TypeError("upload_id must be a UUID or UUID string")
         return UUID(upload_id)
 
-    async def _lock_node(
-        self, conn: AsyncConnection, node_id: Any
-    ) -> dict[str, Any] | None:
+    async def _lock_node(self, conn: AsyncConnection, node_id: Any) -> dict[str, Any] | None:
         """Fetch a node while holding its row lock until transaction end."""
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -508,9 +504,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
             )
             return await cur.fetchone()
 
-    async def _lock_upload(
-        self, conn: AsyncConnection, upload_id: UUID
-    ) -> dict[str, Any] | None:
+    async def _lock_upload(self, conn: AsyncConnection, upload_id: UUID) -> dict[str, Any] | None:
         """Lock an upload only when its root belongs to this filesystem."""
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -544,9 +538,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
             )
             return await cur.fetchone() is not None
 
-    async def _insert_content_chunks(
-        self, cur: Any, node_id: Any, content: bytes
-    ) -> None:
+    async def _insert_content_chunks(self, cur: Any, node_id: Any, content: bytes) -> None:
         """Insert content without constructing a second full chunk/row list."""
         view = memoryview(content)
         rows = (
@@ -615,9 +607,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def _staged_sha256(self, conn: AsyncConnection, upload_id: UUID) -> str:
         digest = hashlib.sha256()
-        async for chunk in self._iter_chunk_data(
-            conn, "vfs_upload_chunks", "upload_id", upload_id
-        ):
+        async for chunk in self._iter_chunk_data(conn, "vfs_upload_chunks", "upload_id", upload_id):
             digest.update(chunk)
         return digest.hexdigest()
 
@@ -632,9 +622,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         """Hash existing and appended bytes without assembling the file."""
         digest = hashlib.sha256()
         remaining = existing_size
-        async for chunk in self._iter_chunk_data(
-            conn, "vfs_chunks", "node_id", node_id
-        ):
+        async for chunk in self._iter_chunk_data(conn, "vfs_chunks", "node_id", node_id):
             if remaining <= 0:
                 break
             logical = chunk[:remaining]
@@ -644,9 +632,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
             raise RuntimeError("existing file chunks are shorter than node size")
 
         remaining = staged_size
-        async for chunk in self._iter_chunk_data(
-            conn, "vfs_upload_chunks", "upload_id", upload_id
-        ):
+        async for chunk in self._iter_chunk_data(conn, "vfs_upload_chunks", "upload_id", upload_id):
             if remaining <= 0:
                 break
             logical = chunk[:remaining]
@@ -717,9 +703,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     )
             output_no += 1
 
-        async for chunk in self._iter_chunk_data(
-            conn, "vfs_upload_chunks", "upload_id", upload_id
-        ):
+        async for chunk in self._iter_chunk_data(conn, "vfs_upload_chunks", "upload_id", upload_id):
             pending.extend(chunk)
             while len(pending) >= chunk_size:
                 await write_output(bytes(pending[:chunk_size]))
@@ -762,9 +746,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                         parent_row["node_id"],
                         name,
                         node_info.is_dir,
-                        "inode/directory"
-                        if node_info.is_dir
-                        else "application/octet-stream",
+                        "inode/directory" if node_info.is_dir else "application/octet-stream",
                     ),
                 )
                 return await cur.fetchone() is not None
@@ -924,9 +906,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     # ON CONFLICT waits for the winning transaction. Lock its
                     # committed node before replacing content so this remains
                     # a create-or-replace operation rather than a lost race.
-                    row = await self._child_for_update(
-                        conn, parent_row["node_id"], name
-                    )
+                    row = await self._child_for_update(conn, parent_row["node_id"], name)
                     if row is None or row["is_dir"]:
                         return False
 
@@ -952,9 +932,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 await self._insert_content_chunks(cur, row["node_id"], content)
             return True
 
-    async def start_upload(
-        self, path: str, exclusive: bool = False, append: bool = False
-    ) -> UUID:
+    async def start_upload(self, path: str, exclusive: bool = False, append: bool = False) -> UUID:
         """Create an invisible, durable staging upload.
 
         Starting and adding parts never creates or modifies the target node.
@@ -1111,9 +1089,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 try:
                     int(sha256, 16)
                 except ValueError as exc:
-                    raise ValueError(
-                        "sha256 must be a 64-character hexadecimal string"
-                    ) from exc
+                    raise ValueError("sha256 must be a 64-character hexadecimal string") from exc
                 sha256 = sha256.lower()
 
             async with self._acquire() as conn, self._tx(conn):
@@ -1167,9 +1143,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                         await discard()
                         return False
                     else:
-                        row = await self._child_for_update(
-                            conn, parent_row["node_id"], name
-                        )
+                        row = await self._child_for_update(conn, parent_row["node_id"], name)
                         if row is None or row["is_dir"]:
                             await discard()
                             return False
@@ -1214,9 +1188,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                                 node_id,
                             ),
                         )
-                        await cur.execute(
-                            "DELETE FROM vfs_chunks WHERE node_id = %s", (node_id,)
-                        )
+                        await cur.execute("DELETE FROM vfs_chunks WHERE node_id = %s", (node_id,))
                         await cur.execute(
                             """
                             INSERT INTO vfs_chunks (node_id, chunk_no, data)

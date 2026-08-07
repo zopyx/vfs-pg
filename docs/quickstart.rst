@@ -72,11 +72,19 @@ Atomic transactions with business tables
     from chuk_vfs_postgres import PostgresStorageProvider
 
     conn = await psycopg.AsyncConnection.connect(DSN)
-    async with conn.transaction():
-        await conn.execute("UPDATE documents SET status='generated' WHERE id=123")
-        provider = PostgresStorageProvider(conn=conn)   # joins the transaction
-        await provider.write_file("/documents/123/result.pdf", pdf)
-        # everything commits together — or rolls back together
+    provider = PostgresStorageProvider(conn=conn)
+    try:
+        await provider.initialize()
+        async with conn.transaction():
+            await conn.execute("UPDATE documents SET status='generated' WHERE id=123")
+            if not await provider.create_directory("/documents/123"):
+                raise OSError("could not create result directory")
+            if not await provider.write_file_atomic("/documents/123/result.pdf", pdf):
+                raise OSError("could not write result")
+            # everything commits together — or rolls back together
+    finally:
+        await provider.close()
+        await conn.close()
 
 Exclusive creation
 ------------------
@@ -95,7 +103,11 @@ Configuration
 
 - ``PostgresStorageProvider(dsn=..., chunk_size=...)`` — chunk size in bytes
   (positive integer; persisted per file).
+- ``filesystem_id=...`` — tenant namespace. It defaults to
+  ``VFS_PG_FILESYSTEM_ID`` and then ``"default"``. Paths, statistics and
+  staging uploads are isolated by namespace, but applications remain
+  responsible for authorization and controlling namespace selection.
 - ``VFS_PG_DSN`` environment variable overrides the default DSN in the
   examples.
-- `Concurrency`_: schema initialization is serialized with a PostgreSQL
+- Concurrency: schema initialization is serialized with a PostgreSQL
   advisory lock; concurrent ``initialize()`` calls cannot deadlock.

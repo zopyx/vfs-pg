@@ -26,7 +26,7 @@ Layering
 Schema
 ------
 
-.. code-block:: sql
+.. code-block:: text
 
     vfs_nodes                          vfs_chunks
     ─────────────────────────          ─────────────────────────
@@ -72,6 +72,21 @@ Concurrency and atomicity
 - Metadata updates merge atomically in SQL (``metadata || %s::jsonb``), so
   concurrent updates of different keys never lose data.
 
+Streaming publication and append
+--------------------------------
+
+PostgreSQL-backed fsspec writes persist blocks in ``vfs_upload_chunks`` as the
+client buffer fills. The target node is not created or changed until
+``finish_upload()`` publishes the complete version in one transaction. This
+keeps Python memory bounded by buffering rather than total file size and makes
+incomplete uploads invisible to readers. Failed context managers abort their
+uploads; ``cleanup()`` removes staging uploads older than 24 hours and must be
+scheduled by the application because there is no background cleanup worker.
+
+Append publication locks the target node. Concurrent appenders therefore keep
+every staged suffix exactly once, serialized in row-lock acquisition order;
+caller start order is not guaranteed.
+
 fsspec adapter details
 ----------------------
 
@@ -94,3 +109,13 @@ Range reads
 ``[start, end)``. ``start`` is clamped to 0, ``end`` to EOF, and
 ``end <= start`` yields ``b""``. Cross-chunk, exact-boundary, empty-file and
 EOF-clamping behaviour is covered by the test suite.
+
+Operational limits
+------------------
+
+``vfs-pg`` is alpha software and does not yet publish a production maximum file
+size or workload envelope. The practical limit depends on PostgreSQL storage,
+WAL generation, vacuum pressure, overwrite churn, backup size and restore time.
+The repository's 256 MiB demo is a reference run, not a capacity guarantee.
+Production adopters must benchmark their own workload and consider object
+storage when database operational costs are no longer acceptable.

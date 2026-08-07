@@ -22,17 +22,13 @@ from chuk_vfs_postgres import PostgresStorageProvider
 async def _mkdir(provider, path: str) -> None:
     parent = "/" if "/" not in path[1:] else path.rsplit("/", 1)[0]
     name = path.rsplit("/", 1)[-1]
-    assert await provider.create_node(
-        EnhancedNodeInfo(name=name, is_dir=True, parent_path=parent)
-    )
+    assert await provider.create_node(EnhancedNodeInfo(name=name, is_dir=True, parent_path=parent))
 
 
 async def _mkfile(provider, path: str) -> None:
     parent = "/" if "/" not in path[1:] else path.rsplit("/", 1)[0]
     name = path.rsplit("/", 1)[-1]
-    assert await provider.create_node(
-        EnhancedNodeInfo(name=name, is_dir=False, parent_path=parent)
-    )
+    assert await provider.create_node(EnhancedNodeInfo(name=name, is_dir=False, parent_path=parent))
 
 
 async def test_concurrent_initialize_no_deadlock(dsn):
@@ -83,9 +79,7 @@ async def test_concurrent_reads_never_see_partial_content(dsn):
         await _mkdir(provider, "/mix")
         rng = random.Random(99)
         initial = {f"/mix/f{i}.bin": rng.randbytes(1024 * 1024 + i) for i in range(4)}
-        final = {
-            path: rng.randbytes(1024 * 1024 + i * 2) for i, path in enumerate(initial)
-        }
+        final = {path: rng.randbytes(1024 * 1024 + i * 2) for i, path in enumerate(initial)}
 
         for path, content in initial.items():
             await _mkfile(provider, path)
@@ -188,9 +182,7 @@ async def test_concurrent_exclusive_writes_single_winner(dsn):
         contents = [rng.randbytes(256 * 1024 + i) for i in range(8)]
 
         async def _write(i: int) -> bool:
-            return await provider.write_file_atomic(
-                "/excl/race.bin", contents[i], exclusive=True
-            )
+            return await provider.write_file_atomic("/excl/race.bin", contents[i], exclusive=True)
 
         results = await asyncio.gather(*(_write(i) for i in range(8)))
         assert results.count(True) == 1
@@ -281,9 +273,7 @@ async def test_staged_overwrite_readers_see_only_old_or_new(dsn):
         assert await provider.write_file_atomic("/atomic-stage.bin", old)
         upload_id = await provider.start_upload("/atomic-stage.bin")
         for offset in range(0, len(new), 31 * 1024):
-            assert await provider.upload_part(
-                upload_id, new[offset : offset + 31 * 1024]
-            )
+            assert await provider.upload_part(upload_id, new[offset : offset + 31 * 1024])
             assert await provider.read_file("/atomic-stage.bin") == old
 
         allowed = {hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest()}

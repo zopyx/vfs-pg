@@ -53,9 +53,7 @@ class ChukBufferedFile(AbstractBufferedFile):
         details: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(
-            fs, path, mode=mode, block_size=block_size, size=size, **kwargs
-        )
+        super().__init__(fs, path, mode=mode, block_size=block_size, size=size, **kwargs)
         if details is not None:
             self.details = details
         self._append = "a" in mode
@@ -99,9 +97,7 @@ class ChukBufferedFile(AbstractBufferedFile):
                     self._upload_size += len(data)
                 if final:
                     digest = (
-                        self._upload_sha256.hexdigest()
-                        if self._upload_sha256 is not None
-                        else None
+                        self._upload_sha256.hexdigest() if self._upload_sha256 is not None else None
                     )
                     ok = self.fs.finish_upload(
                         self.path,
@@ -240,10 +236,7 @@ class ChukFileSystem(AsyncFileSystem):
             raise FileNotFoundError(path)
         entries = await self.vfs.ls(path)
         if detail:
-            return [
-                await self._info(posixpath.join(path, name))
-                for name in entries
-            ]
+            return [await self._info(posixpath.join(path, name)) for name in entries]
         # fsspec convention: non-detailed ls returns full paths
         return [posixpath.join(path, name) for name in entries]
 
@@ -277,9 +270,7 @@ class ChukFileSystem(AsyncFileSystem):
         if node.is_dir:
             children = await self.vfs.ls(path)
             if children and not recursive:
-                raise ValueError(
-                    f"Cannot delete non-empty directory: {path} (use recursive=True)"
-                )
+                raise ValueError(f"Cannot delete non-empty directory: {path} (use recursive=True)")
             for name in children:
                 await self._rm(posixpath.join(path, name), recursive=True)
         return bool(await self.vfs.rm(path))
@@ -356,8 +347,7 @@ class ChukFileSystem(AsyncFileSystem):
                 written = output.write(data)
                 if written is not None and written != len(data):
                     raise OSError(
-                        f"short local write for {rpath}: "
-                        f"expected {len(data)}, wrote {written}"
+                        f"short local write for {rpath}: expected {len(data)}, wrote {written}"
                     )
                 callback.relative_update(len(data))
 

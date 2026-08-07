@@ -26,8 +26,14 @@ Features
 - **Atomic transactions** — the provider can join an existing connection,
   committing filesystem metadata, file content and business-table rows
   together (or rolling them all back).
-- **Database-enforced integrity** — a unique index on ``(parent_id, name)``
-  makes duplicate sibling creation impossible, even under concurrency;
+- **Tenant namespaces** — paths, content, staging uploads and statistics are
+  scoped by ``filesystem_id`` so isolated filesystems can share one database.
+- **Bounded streaming writes** — fsspec buffers are staged in PostgreSQL and
+  the completed version is published atomically; appends serialize on the
+  target row so concurrent suffixes are not lost.
+- **Database-enforced integrity** — a unique index on
+  ``(filesystem_id, parent_id, name)`` makes duplicate sibling creation
+  impossible within a namespace, even under concurrency;
   exclusive creation (fsspec ``xb``) is enforced by the database, not by a
   preflight check.
 - **fsspec integration** — ``chuk://`` protocol, buffered file objects with

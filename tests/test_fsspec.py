@@ -98,9 +98,10 @@ def test_strip_protocol_returns_canonical_absolute_path(path, expected):
 
 
 def test_strip_protocol_handles_path_lists():
-    assert ChukFileSystem._strip_protocol(
-        ["chuk://one/file", "chuk:///two//./file"]
-    ) == ["/one/file", "/two/file"]
+    assert ChukFileSystem._strip_protocol(["chuk://one/file", "chuk:///two//./file"]) == [
+        "/one/file",
+        "/two/file",
+    ]
 
 
 def test_strip_protocol_rejects_parent_nul_and_non_string_paths():
@@ -226,9 +227,10 @@ def test_cat_file_range(fs):
     content = bytes(range(256)) * (CHUNK // 256) * 2
     fs.pipe_file("/big.bin", content)
     assert fs.cat_file("/big.bin", start=100, end=200) == content[100:200]
-    assert fs.cat_file("/big.bin", start=CHUNK - 10, end=CHUNK + 10) == content[
-        CHUNK - 10 : CHUNK + 10
-    ]
+    assert (
+        fs.cat_file("/big.bin", start=CHUNK - 10, end=CHUNK + 10)
+        == content[CHUNK - 10 : CHUNK + 10]
+    )
     assert fs.cat_file("/big.bin", start=CHUNK + 5) == content[CHUNK + 5 :]
 
 

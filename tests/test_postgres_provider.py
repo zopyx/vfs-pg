@@ -25,17 +25,13 @@ CHUNK = 1024 * 1024
 async def _mkfile(provider, path: str) -> None:
     parent = "/" if "/" not in path[1:] else path.rsplit("/", 1)[0]
     name = path.rsplit("/", 1)[-1]
-    assert await provider.create_node(
-        EnhancedNodeInfo(name=name, is_dir=False, parent_path=parent)
-    )
+    assert await provider.create_node(EnhancedNodeInfo(name=name, is_dir=False, parent_path=parent))
 
 
 async def _mkdir(provider, path: str) -> None:
     parent = "/" if "/" not in path[1:] else path.rsplit("/", 1)[0]
     name = path.rsplit("/", 1)[-1]
-    assert await provider.create_node(
-        EnhancedNodeInfo(name=name, is_dir=True, parent_path=parent)
-    )
+    assert await provider.create_node(EnhancedNodeInfo(name=name, is_dir=True, parent_path=parent))
 
 
 # ----------------------------------------------------------------------
@@ -99,12 +95,11 @@ async def test_schema_namespace_indexes_and_default_migration(provider, dsn):
 
     before, column = await definitions_and_oids()
     assert column == ("'default'::text", "NO")
-    assert "(filesystem_id) WHERE (parent_id IS NULL)" in before[
-        "uq_vfs_nodes_root"
-    ][1]
-    assert "(filesystem_id, parent_id, name) WHERE (parent_id IS NOT NULL)" in before[
-        "uq_vfs_nodes_sibling"
-    ][1]
+    assert "(filesystem_id) WHERE (parent_id IS NULL)" in before["uq_vfs_nodes_root"][1]
+    assert (
+        "(filesystem_id, parent_id, name) WHERE (parent_id IS NOT NULL)"
+        in before["uq_vfs_nodes_sibling"][1]
+    )
 
     # A fresh provider performs schema initialization again. Correct indexes
     # keep their OIDs instead of being dropped and recreated on every call.
@@ -327,17 +322,13 @@ async def test_external_provider_close_requires_reinitialize(external_conn):
 
 async def test_create_node_requires_existing_parent(provider):
     assert (
-        await provider.create_node(
-            EnhancedNodeInfo(name="x", is_dir=True, parent_path="/nope")
-        )
+        await provider.create_node(EnhancedNodeInfo(name="x", is_dir=True, parent_path="/nope"))
         is False
     )
     # parent must be a directory
     await _mkfile(provider, "/f.txt")
     assert (
-        await provider.create_node(
-            EnhancedNodeInfo(name="x", is_dir=True, parent_path="/f.txt")
-        )
+        await provider.create_node(EnhancedNodeInfo(name="x", is_dir=True, parent_path="/f.txt"))
         is False
     )
 
@@ -345,19 +336,14 @@ async def test_create_node_requires_existing_parent(provider):
 async def test_duplicate_node_rejected(provider):
     await _mkdir(provider, "/a")
     assert (
-        await provider.create_node(
-            EnhancedNodeInfo(name="a", is_dir=True, parent_path="/")
-        )
+        await provider.create_node(EnhancedNodeInfo(name="a", is_dir=True, parent_path="/"))
         is False
     )
 
 
 async def test_root_node_ops_rejected(provider):
     assert (
-        await provider.create_node(
-            EnhancedNodeInfo(name="", is_dir=True, parent_path="/")
-        )
-        is False
+        await provider.create_node(EnhancedNodeInfo(name="", is_dir=True, parent_path="/")) is False
     )
     assert await provider.delete_node("/") is False
     assert await provider.move_node("/", "/x") is False
@@ -496,13 +482,9 @@ async def test_read_range_across_chunk_boundary(provider):
     await provider.write_file("/range.bin", content)
 
     assert await provider.read_range("/range.bin", 100, 200) == content[100:200]
+    assert await provider.read_range("/range.bin", cs - 10, cs + 10) == content[cs - 10 : cs + 10]
     assert (
-        await provider.read_range("/range.bin", cs - 10, cs + 10)
-        == content[cs - 10 : cs + 10]
-    )
-    assert (
-        await provider.read_range("/range.bin", cs + 5, cs + 5 + 100)
-        == content[cs + 5 : cs + 105]
+        await provider.read_range("/range.bin", cs + 5, cs + 5 + 100) == content[cs + 5 : cs + 105]
     )
     # beyond EOF clamps
     assert (
@@ -579,14 +561,12 @@ async def test_chunk_size_is_per_file_self_describing(dsn):
         assert await reader.read_file("/mixed.bin") == content
         cs64 = 64 * 1024
         for start, end in [
-            (cs64 - 5, cs64 + 5),       # writer chunk boundary
+            (cs64 - 5, cs64 + 5),  # writer chunk boundary
             (2 * cs64, 2 * cs64 + 100),  # exact boundary start
-            (100_000, 150_000),          # inside writer chunk 1
+            (100_000, 150_000),  # inside writer chunk 1
             (len(content) - 10, len(content) + 50),
         ]:
-            assert await reader.read_range("/mixed.bin", start, end) == content[
-                start:end
-            ]
+            assert await reader.read_range("/mixed.bin", start, end) == content[start:end]
     finally:
         await writer.close()
         await reader.close()
@@ -702,14 +682,10 @@ async def test_move_destination_race_keeps_joined_transaction_usable(
     monkeypatch.setattr(joined, "_child", _pause_after_destination_check)
 
     async with external_conn.transaction():
-        move = asyncio.create_task(
-            joined.move_node("/source.txt", "/destination/target.txt")
-        )
+        move = asyncio.create_task(joined.move_node("/source.txt", "/destination/target.txt"))
         await asyncio.wait_for(destination_checked.wait(), timeout=2)
         assert await provider.create_node(
-            EnhancedNodeInfo(
-                name="target.txt", is_dir=False, parent_path="/destination"
-            )
+            EnhancedNodeInfo(name="target.txt", is_dir=False, parent_path="/destination")
         )
         resume_move.set()
 
@@ -777,9 +753,7 @@ async def test_metadata_json_types(provider):
 async def test_atomic_transaction_with_business_tables(provider, external_conn):
     # deterministic start: business_docs is outside the VFS clean-up scope
     await external_conn.execute("DROP TABLE IF EXISTS business_docs")
-    await external_conn.execute(
-        "CREATE TABLE business_docs (id serial PRIMARY KEY, name text)"
-    )
+    await external_conn.execute("CREATE TABLE business_docs (id serial PRIMARY KEY, name text)")
     await external_conn.commit()  # leave IDLE so transaction() is a real tx
 
     try:
@@ -792,14 +766,10 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
                     EnhancedNodeInfo(name="tx.pdf", is_dir=False, parent_path="/")
                 )
                 assert await joined.write_file("/tx.pdf", b"tx-content")
-                await external_conn.execute(
-                    "INSERT INTO business_docs (name) VALUES ('tx.pdf')"
-                )
+                await external_conn.execute("INSERT INTO business_docs (name) VALUES ('tx.pdf')")
                 raise RuntimeError("abort")  # trigger rollback
         assert not await provider.exists("/tx.pdf")
-        rows = await (
-            await external_conn.execute("SELECT COUNT(*) FROM business_docs")
-        ).fetchone()
+        rows = await (await external_conn.execute("SELECT COUNT(*) FROM business_docs")).fetchone()
         assert rows[0] == 0
         await external_conn.commit()  # clear implicit tx -> next transaction() is real
 
@@ -811,13 +781,9 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
                 EnhancedNodeInfo(name="tx.pdf", is_dir=False, parent_path="/")
             )
             assert await joined2.write_file("/tx.pdf", b"tx-content")
-            await external_conn.execute(
-                "INSERT INTO business_docs (name) VALUES ('tx.pdf')"
-            )
+            await external_conn.execute("INSERT INTO business_docs (name) VALUES ('tx.pdf')")
         assert await provider.read_file("/tx.pdf") == b"tx-content"
-        rows = await (
-            await external_conn.execute("SELECT COUNT(*) FROM business_docs")
-        ).fetchone()
+        rows = await (await external_conn.execute("SELECT COUNT(*) FROM business_docs")).fetchone()
         assert rows[0] == 1
     finally:
         await external_conn.execute("DROP TABLE IF EXISTS business_docs")
@@ -937,7 +903,7 @@ async def test_create_directory_missing_parent_root(provider):
 
 async def test_write_file_atomic_str_content(provider):
     assert await provider.write_file_atomic("/str.txt", "héllo")
-    assert await provider.read_file("/str.txt") == "héllo".encode("utf-8")
+    assert await provider.read_file("/str.txt") == "héllo".encode()
 
 
 async def test_write_file_atomic_on_existing_directory(provider):
@@ -1002,9 +968,7 @@ async def test_staged_upload_parts_cross_chunk_boundaries(dsn):
             assert await cur.fetchall() == [(0, b"abcd"), (1, b"efgh")]
 
         content = b"abcdefgh"
-        assert await p.finish_upload(
-            upload_id, len(content), hashlib.sha256(content).hexdigest()
-        )
+        assert await p.finish_upload(upload_id, len(content), hashlib.sha256(content).hexdigest())
         assert await p.read_file("/staged.bin") == content
         async with p._acquire() as conn, conn.cursor() as cur:
             await cur.execute(
@@ -1058,9 +1022,7 @@ async def test_abort_and_failed_finish_leave_target_unchanged(provider):
 
 async def test_empty_staged_upload_creates_empty_file(provider):
     upload_id = await provider.start_upload("/empty-staged.bin")
-    assert await provider.finish_upload(
-        upload_id, size=0, sha256=hashlib.sha256(b"").hexdigest()
-    )
+    assert await provider.finish_upload(upload_id, size=0, sha256=hashlib.sha256(b"").hexdigest())
     assert await provider.read_file("/empty-staged.bin") == b""
 
 
@@ -1184,9 +1146,7 @@ async def test_initialize_concurrent_same_instance_hits_double_check(dsn):
     waits on the lock and hits the double-check (line 149)."""
     provider = PostgresStorageProvider(dsn=dsn)
     try:
-        results = await asyncio.gather(
-            provider.initialize(), provider.initialize()
-        )
+        results = await asyncio.gather(provider.initialize(), provider.initialize())
         assert results == [True, True]
         assert provider._initialized
     finally:
@@ -1233,9 +1193,11 @@ async def test_create_directory_returns_false_when_parent_missing(provider):
 
 async def test_initialize_failure_cleans_up_pool():
     """Pool open failure triggers cleanup path (lines 165-170)."""
-    p = PostgresStorageProvider(dsn="postgresql://invalid:5432/nonexistent")
+    p = PostgresStorageProvider(
+        dsn="postgresql://invalid@127.0.0.1:1/nonexistent?connect_timeout=1"
+    )
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(psycopg.OperationalError):
             await p.initialize()
         assert p._pool is None
         assert p._initialized is False

@@ -4,7 +4,7 @@ Tasks are ordered by risk and dependency. Complete the data-integrity and lifecy
 
 ## P0 — Data integrity and corruption prevention
 
-### [ ] Prevent duplicate sibling nodes
+### [x] Prevent duplicate sibling nodes
 
 - Add a database-level unique constraint or unique index on `(parent_id, name)` for non-root nodes.
 - Keep the partial root uniqueness constraint.
@@ -18,7 +18,7 @@ Acceptance criteria:
 - No caller receives success for a node that was not created by that operation.
 - Concurrent `mkdir`, `touch`, and first-write tests cover this behavior.
 
-### [ ] Reject directory moves into their own descendants
+### [x] Reject directory moves into their own descendants
 
 - In `move_node()`, return success immediately when source and destination are identical.
 - Reject moving a directory beneath itself or any descendant.
@@ -31,7 +31,7 @@ Acceptance criteria:
 - Moving a path onto itself is an idempotent success.
 - Normal file and directory moves continue to preserve content and metadata.
 
-### [ ] Make chunk layout self-describing
+### [x] Make chunk layout self-describing
 
 - Validate that configured `chunk_size` is a positive integer.
 - Store the chunk size with each file/content version, or enforce one immutable database-wide value.
@@ -44,7 +44,7 @@ Acceptance criteria:
 - Invalid chunk sizes fail during provider construction or initialization.
 - Cross-chunk, exact-boundary, empty-file, and EOF-clamping tests pass.
 
-### [ ] Make exclusive creation (`xb`) truly exclusive
+### [x] Make exclusive creation (`xb`) truly exclusive
 
 - Raise `FileExistsError` when opening or committing an existing path with `xb`.
 - Enforce exclusivity with the database uniqueness constraint, not only a preflight existence check.
@@ -58,7 +58,7 @@ Acceptance criteria:
 
 ## P1 — Transactions and provider lifecycle
 
-### [ ] Fix schema-initialization locking
+### [x] Fix schema-initialization locking
 
 - Replace the session-level `pg_advisory_lock()` with `pg_advisory_xact_lock()` in a controlled transaction.
 - Preserve the original schema error instead of masking it with an unlock failure.
@@ -71,7 +71,7 @@ Acceptance criteria:
 - A forced schema error releases the advisory lock when the transaction rolls back.
 - A provider can initialize successfully after an earlier initialization failure.
 
-### [ ] Make `initialize()` idempotent and concurrency-safe
+### [x] Make `initialize()` idempotent and concurrency-safe
 
 - Return immediately when an already initialized provider is initialized again.
 - Serialize concurrent `initialize()` calls on the same instance.
@@ -84,7 +84,7 @@ Acceptance criteria:
 - `close()` is idempotent.
 - Operations after close fail consistently until reinitialization, including providers using an external connection.
 
-### [ ] Make new-file writes atomic
+### [x] Make new-file writes atomic
 
 - Address the current high-level `touch` followed by `write_file` sequence, which spans separate pooled transactions.
 - Add an atomic provider operation for create-or-replace content, or expose a transaction boundary that covers node creation and chunk insertion.
@@ -96,7 +96,7 @@ Acceptance criteria:
 - Overwrites remain atomic: readers observe the complete old or complete new version.
 - External-connection transaction joining continues to commit and roll back filesystem and business data together.
 
-### [ ] Make metadata updates concurrency-safe
+### [x] Make metadata updates concurrency-safe
 
 - Replace read/merge/write metadata updates with an atomic JSONB merge expression.
 - Decide and document whether metadata updates change `modified_at`.
@@ -104,28 +104,28 @@ Acceptance criteria:
 
 ## P1 — fsspec contract compliance
 
-### [ ] Register the `chuk` protocol during package installation
+### [x] Register the `chuk` protocol during package installation
 
 - Add a `fsspec.specs` entry point in `pyproject.toml` for `ChukFileSystem`.
 - Keep explicit registration supported for development and testing.
 - Add a clean-process test that calls `fsspec.filesystem("chuk", vfs=vfs)` without manual registration.
 - Update the README with the exact supported initialization path.
 
-### [ ] Correct `mkdir` semantics
+### [x] Correct `mkdir` semantics
 
 - Honor `create_parents=False`.
 - Treat an existing directory as the documented idempotent case.
 - Raise an appropriate error when the target or an intermediate component is a file.
 - Handle concurrent directory creation without creating duplicates.
 
-### [ ] Use provider-local paths for mounted filesystems
+### [x] Use provider-local paths for mounted filesystems
 
 - Preserve both values returned by `_get_provider_for_path()`.
 - Pass the translated local path to provider extension methods such as `read_range()`.
 - Avoid private `AsyncVirtualFileSystem` APIs if a stable public alternative is available.
 - Test range reads through a mounted provider.
 
-### [ ] Align listing and range behavior with fsspec conventions
+### [x] Align listing and range behavior with fsspec conventions
 
 - Verify whether `ls(..., detail=False)` should return full paths rather than basenames, and make detailed and non-detailed output consistent.
 - Define and test negative `start`/`end` range semantics.
@@ -133,7 +133,7 @@ Acceptance criteria:
 
 ## P2 — Streaming and scalability
 
-### [ ] Implement bounded-memory, atomic uploads
+### [x] Implement bounded-memory, atomic uploads
 
 - Stop retaining the complete file in `ChukBufferedFile._parts`.
 - Stop constructing a second complete list of chunks in `PostgresStorageProvider.write_file()`.
@@ -147,7 +147,7 @@ Acceptance criteria:
 - Readers never see incomplete upload versions.
 - Interrupted uploads are recoverable or cleaned by a defined process.
 
-### [ ] Define safe concurrent append semantics
+### [x] Define safe concurrent append semantics
 
 - Replace append read-modify-write with row locking, optimistic version checks, or a dedicated append operation.
 - Document whether multiple appenders are serialized and what ordering guarantee applies.
@@ -161,20 +161,20 @@ Acceptance criteria:
 
 ## P2 — Isolation, packaging, and test safety
 
-### [ ] Add filesystem/tenant isolation
+### [x] Add filesystem/tenant isolation
 
 - Add a `filesystem_id` or namespace key to nodes and chunks.
 - Scope root uniqueness, sibling uniqueness, queries, and statistics to that identifier.
 - Avoid forcing every provider using the same database to share one global root.
 
-### [ ] Prevent tests from truncating arbitrary databases
+### [x] Prevent tests from truncating arbitrary databases
 
 - Run integration tests in a disposable database or isolated schema.
 - Alternatively, require an explicit test-only opt-in and validate the target database name before destructive setup.
 - Remove unconditional `TRUNCATE vfs_nodes CASCADE` against arbitrary `VFS_PG_DSN` values.
 - Ensure business-table transaction tests clean up and commit their cleanup.
 
-### [ ] Improve reproducibility and package metadata
+### [x] Improve reproducibility and package metadata
 
 - Decide whether this repository is an application or a reusable library.
 - Commit `uv.lock` for reproducible application/test environments, or document the library dependency policy.
@@ -206,9 +206,9 @@ Acceptance criteria:
 
 Before declaring the prototype production-ready:
 
-- [ ] All existing tests pass.
-- [ ] Regression tests cover every P0 and P1 defect above.
-- [ ] Concurrency tests run repeatedly without duplicate nodes, deadlocks, lost appends, or partial reads.
-- [ ] Tests run only against an isolated disposable database/schema.
+- [x] All existing tests pass.
+- [x] Regression tests cover every P0 and P1 defect above.
+- [x] Concurrency tests run repeatedly without duplicate nodes, deadlocks, lost appends, or partial reads.
+- [x] Tests run only against an isolated disposable database/schema.
 - [ ] A large-file benchmark demonstrates bounded memory and documents WAL/storage costs.
-- [ ] Documentation accurately describes registration, transaction guarantees, file-size limits, and multi-tenant behavior.
+- [x] Documentation accurately describes registration, transaction guarantees, file-size limits, and multi-tenant behavior.

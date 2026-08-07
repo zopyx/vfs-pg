@@ -4,7 +4,8 @@ Testing
 The test suite runs against a **throwaway PostgreSQL server started by
 testcontainers** (``postgres:16-alpine``) — no docker-compose or manual setup.
 A random ``VFS_PG_FILESYSTEM_ID`` isolates every test session, including
-sessions pointed at an existing shared database.
+sessions pointed at an existing shared database. The current suite contains
+152 tests.
 
 .. code-block:: bash
 
@@ -21,8 +22,8 @@ Safety
   children and staging uploads. It never uses ``TRUNCATE`` and never examines
   the database name to infer safety.
 - Session teardown deletes the random test root, cascading only that
-  namespace's nodes, chunks, and uploads. ``VFS_PG_ALLOW_TRUNCATE`` is not
-  needed when using ``VFS_PG_DSN``.
+  namespace's nodes, chunks, and uploads. Tests never truncate shared VFS
+  tables, including when ``VFS_PG_DSN`` points at an existing server.
 - The container image can be changed with ``VFS_PG_IMAGE``.
 
 Suite layout

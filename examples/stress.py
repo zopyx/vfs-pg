@@ -67,9 +67,7 @@ async def writer_loop(vfs, name: str, counter: Counter, deadline: float) -> None
         ok = False
         try:
             # generation + hashing are CPU-bound -> keep them off the loop
-            content, sha = await asyncio.to_thread(
-                _make_content, random.randrange(1 << 30), size
-            )
+            content, sha = await asyncio.to_thread(_make_content, random.randrange(1 << 30), size)
             ok = await vfs.write_file(path, content)
             if ok:
                 node = await vfs.get_node_info(path)

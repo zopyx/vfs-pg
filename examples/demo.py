@@ -89,11 +89,11 @@ async def main() -> None:
     cs = CHUNK
     bs = 5 * CHUNK  # fsspec DEFAULT_BLOCK_SIZE
     windows = [
-        (0, 16),               # head
-        (cs - 8, 32),          # spans chunk 0 -> 1
-        (bs - 8, 64),          # spans fsspec block 0 -> 1
-        (size // 2, 4096),     # middle of file
-        (size - 16, 16),       # tail
+        (0, 16),  # head
+        (cs - 8, 32),  # spans chunk 0 -> 1
+        (bs - 8, 64),  # spans fsspec block 0 -> 1
+        (size // 2, 4096),  # middle of file
+        (size - 16, 16),  # tail
     ]
     for start, n in windows:
         part = fs.cat_file(path, start=start, end=start + n)
@@ -106,8 +106,7 @@ async def main() -> None:
 
     print(f"generate  : {t_gen:6.2f}s")
     print(
-        f"store     : {t_store:6.2f}s  ({mbps(t_store):6.0f} MiB/s)"
-        "  1 MiB writes via fs.open('wb')"
+        f"store     : {t_store:6.2f}s  ({mbps(t_store):6.0f} MiB/s)  1 MiB writes via fs.open('wb')"
     )
     print(
         f"read      : {t_read:6.2f}s  ({mbps(t_read):6.0f} MiB/s)"

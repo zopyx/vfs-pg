@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,13 +21,33 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra test --python ${{ matrix.python-version }}
+        run: uv sync --frozen --extra test --extra docs --python ${{ matrix.python-version }}
 
       - name: Lint
-        run: uv run ruff check src/ tests/ examples/
+        run: uv run --frozen ruff check src/ tests/ examples/
 
-      - name: Test (testcontainers PostgreSQL)
-        run: uv run pytest -v
+      - name: Check formatting
+        run: uv run --frozen ruff format --check src/ tests/ examples/
+
+      - name: Test with coverage (testcontainers PostgreSQL)
+        run: >-
+          uv run --frozen pytest -v
+          --cov=chuk_vfs_postgres --cov=chuk_fsspec
+          --cov-report=term-missing --cov-fail-under=94
+
+      - name: Build documentation strictly
+        run: >-
+          uv run --frozen sphinx-build -W --keep-going
+          -b html docs docs/_build/html
 
       - name: Build package
         run: uv build
+
+      - name: Smoke-test clean wheel install and entry point
+        shell: bash
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel"
+          uv run --isolated --no-project --python ${{ matrix.python-version }} \
+            --with "$wheel" python -c \
+            'from importlib.metadata import distribution, entry_points; import chuk_fsspec, chuk_vfs_postgres; dist = distribution("vfs-pg"); assert dist.metadata["Name"] == "vfs-pg"; assert dist.metadata["License-Expression"] == "MIT"; assert dist.metadata["Requires-Python"] == ">=3.12"; eps = list(entry_points(group="fsspec.specs", name="chuk")); assert len(eps) == 1; assert eps[0].load() is chuk_fsspec.ChukFileSystem'
