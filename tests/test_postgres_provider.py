@@ -1,4 +1,11 @@
-"""Tests for the PostgreSQL storage provider (chuk_vfs_postgres)."""
+"""Tests for the PostgreSQL storage provider (chuk_vfs_postgres).
+
+Covers the full chuk provider API: lifecycle, schema, nodes, content
+write/read, chunk-aware range reads, move/delete semantics, metadata,
+transaction joining and the chuk AsyncVirtualFileSystem integration.
+"""
+
+from __future__ import annotations
 
 import hashlib
 import random
@@ -32,6 +39,7 @@ async def _mkdir(provider, path: str) -> None:
 # lifecycle / schema
 # ----------------------------------------------------------------------
 
+
 async def test_initialize_creates_root(provider):
     assert await provider.exists("/")
     node = await provider.get_node_info("/")
@@ -43,15 +51,39 @@ async def test_get_storage_stats(provider):
     assert stats["directory_count"] >= 1
     assert stats["file_count"] == 0
     assert stats["total_size_bytes"] == 0
+    assert stats["chunk_count"] == 0
 
 
 async def test_double_initialize_is_safe(provider):
     assert await provider.initialize() is True
 
 
+async def test_double_close_is_safe(provider):
+    await provider.close()
+    await provider.close()  # must not raise
+    # provider is usable again after re-initialize
+    assert await provider.initialize() is True
+
+
+async def test_cleanup_is_noop(provider):
+    assert await provider.cleanup() == {
+        "files_removed": 0,
+        "bytes_freed": 0,
+        "expired_removed": 0,
+    }
+
+
+async def test_uninitialized_provider_raises(dsn):
+    p = PostgresStorageProvider(dsn=dsn)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await p.read_file("/x")
+    await p.close()
+
+
 # ----------------------------------------------------------------------
 # nodes
 # ----------------------------------------------------------------------
+
 
 async def test_create_node_requires_existing_parent(provider):
     assert (
@@ -80,6 +112,25 @@ async def test_duplicate_node_rejected(provider):
     )
 
 
+async def test_root_node_ops_rejected(provider):
+    assert (
+        await provider.create_node(
+            EnhancedNodeInfo(name="", is_dir=True, parent_path="/")
+        )
+        is False
+    )
+    assert await provider.delete_node("/") is False
+    assert await provider.move_node("/", "/x") is False
+    assert await provider.move_node("/x", "/") is False
+
+
+async def test_path_trailing_slash_normalized(provider):
+    await _mkfile(provider, "/f.bin")
+    assert await provider.write_file("/f.bin/", b"x")  # "/f.bin/" -> "/f.bin"
+    assert await provider.read_file("/f.bin//") == b"x"
+    assert await provider.exists("/f.bin/")
+
+
 async def test_list_directory_sorted(provider):
     await _mkdir(provider, "/b")
     await _mkdir(provider, "/a")
@@ -102,18 +153,46 @@ async def test_get_node_info_fields(provider):
     assert node.sha256 == hashlib.sha256(b"abc").hexdigest()
     assert node.provider == "postgres"
     assert node.is_dir is False
+    assert node.permissions == "644"
+    assert node.mime_type == "application/octet-stream"
     assert await provider.get_node_info("/missing") is None
+
+
+async def test_directory_mime_type(provider):
+    await _mkdir(provider, "/d")
+    node = await provider.get_node_info("/d")
+    assert node is not None
+    assert node.is_dir and node.mime_type == "inode/directory"
+    assert node.permissions == "755"
 
 
 # ----------------------------------------------------------------------
 # content: write / read / chunking / ranges
 # ----------------------------------------------------------------------
 
+
 async def test_write_read_roundtrip(provider):
     await _mkfile(provider, "/hello.txt")
     content = b"Hello, PostgreSQL VFS!"
     assert await provider.write_file("/hello.txt", content)
     assert await provider.read_file("/hello.txt") == content
+
+
+async def test_write_empty_file(provider):
+    await _mkfile(provider, "/empty.bin")
+    assert await provider.write_file("/empty.bin", b"")
+    assert await provider.read_file("/empty.bin") == b""
+    assert await provider.read_range("/empty.bin", 0, 10) == b""
+    node = await provider.get_node_info("/empty.bin")
+    assert node.size == 0
+    assert node.sha256 == hashlib.sha256(b"").hexdigest()
+
+
+async def test_write_str_and_unicode(provider):
+    await _mkfile(provider, "/u.txt")
+    text = "héllo wörld ☃ — Grüße"
+    assert await provider.write_file("/u.txt", text)
+    assert await provider.read_file("/u.txt") == text.encode("utf-8")
 
 
 async def test_overwrite_replaces_content(provider):
@@ -123,6 +202,9 @@ async def test_overwrite_replaces_content(provider):
     assert await provider.read_file("/f.bin") == b"a" * (2 * CHUNK + 7)
     node = await provider.get_node_info("/f.bin")
     assert node.size == 2 * CHUNK + 7
+    # old chunks are gone, new chunk count is exact
+    stats = await provider.get_storage_stats()
+    assert stats["chunk_count"] == 3
 
 
 async def test_multichunk_write_read(provider):
@@ -171,9 +253,69 @@ async def test_read_range_across_chunk_boundary(provider):
     assert await provider.read_range("/range.bin", 50, 10) == b""
 
 
+async def test_read_range_exact_chunk_boundary(provider):
+    cs = provider.chunk_size
+    content = bytes(range(256)) * (cs // 256) * 2
+    await _mkfile(provider, "/edge.bin")
+    await provider.write_file("/edge.bin", content)
+    # window starting exactly on a chunk boundary
+    assert await provider.read_range("/edge.bin", cs, cs + 5) == content[cs : cs + 5]
+    # window ending exactly on a boundary
+    assert await provider.read_range("/edge.bin", cs - 5, cs) == content[cs - 5 : cs]
+
+
+async def test_read_range_negative_start_clamps(provider):
+    await _mkfile(provider, "/neg.bin")
+    await provider.write_file("/neg.bin", b"0123456789")
+    assert await provider.read_range("/neg.bin", -100, 5) == b"01234"
+    assert await provider.read_range("/neg.bin", -100, None) == b"0123456789"
+
+
+async def test_read_range_missing_and_dir(provider):
+    await _mkdir(provider, "/d")
+    assert await provider.read_range("/missing", 0, 10) is None
+    assert await provider.read_range("/d", 0, 10) is None
+
+
+async def test_custom_chunk_size_provider(dsn):
+    p = PostgresStorageProvider(dsn=dsn, chunk_size=64 * 1024)
+    assert await p.initialize()
+    try:
+        await _mkfile(p, "/c.bin")
+        content = bytes(range(256)) * 600  # 153600 B = 2.34 x 64 KiB
+        assert await p.write_file("/c.bin", content)
+        assert await p.read_file("/c.bin") == content
+        stats = await p.get_storage_stats()
+        assert stats["chunk_count"] == 3
+        cs = 64 * 1024
+        assert await p.read_range("/c.bin", cs - 5, cs + 5) == content[cs - 5 : cs + 5]
+    finally:
+        await p.close()
+
+
+async def test_randomized_ranges_match_read_file(provider):
+    """Property-style check: read_range windows agree with read_file slices."""
+    rng = random.Random(20260807)
+    for i in range(15):
+        size = rng.randrange(0, 5 * CHUNK)  # 0..5 MiB, crosses chunk boundaries
+        content = rng.randbytes(size)
+        path = f"/rand_{i}.bin"
+        await _mkfile(provider, path)
+        assert await provider.write_file(path, content)
+        assert await provider.read_file(path) == content
+        for _ in range(5):
+            start = rng.randrange(0, max(1, size))
+            length = rng.randrange(1, min(200_000, size - start + 1))
+            assert (
+                await provider.read_range(path, start, start + length)
+                == content[start : start + length]
+            )
+
+
 # ----------------------------------------------------------------------
 # move / delete
 # ----------------------------------------------------------------------
+
 
 async def test_move_file_and_rename_dir(provider):
     await _mkdir(provider, "/a")
@@ -189,6 +331,17 @@ async def test_move_file_and_rename_dir(provider):
     assert await provider.move_node("/b", "/b2")
     assert await provider.read_file("/b2/f.txt") == b"data"
     assert (await provider.get_node_info("/b2")).is_dir
+
+
+async def test_move_preserves_content_and_metadata(provider):
+    await _mkdir(provider, "/a")
+    await _mkfile(provider, "/a/s.txt")
+    await provider.write_file("/a/s.txt", b"payload")
+    await provider.set_metadata("/a/s.txt", {"owner": "ajung"})
+    assert await provider.move_node("/a/s.txt", "/s.txt")
+    node = await provider.get_node_info("/s.txt")
+    assert node.sha256 == hashlib.sha256(b"payload").hexdigest()
+    assert await provider.get_metadata("/s.txt") == {"owner": "ajung"}
 
 
 async def test_move_protects_destination(provider):
@@ -227,6 +380,7 @@ async def test_delete_semantics_and_cascade(provider):
 # metadata
 # ----------------------------------------------------------------------
 
+
 async def test_metadata_roundtrip_and_merge(provider):
     await _mkfile(provider, "/m.txt")
     assert await provider.set_metadata("/m.txt", {"owner": "ajung", "project": "vfs"})
@@ -245,9 +399,17 @@ async def test_metadata_roundtrip_and_merge(provider):
     assert await provider.set_metadata("/missing", {"a": 1}) is False
 
 
+async def test_metadata_json_types(provider):
+    await _mkfile(provider, "/j.txt")
+    meta = {"tags": ["a", "b"], "count": 3, "flag": True, "nested": {"k": "v"}}
+    assert await provider.set_metadata("/j.txt", meta)
+    assert await provider.get_metadata("/j.txt") == meta
+
+
 # ----------------------------------------------------------------------
 # transaction join (the killer feature)
 # ----------------------------------------------------------------------
+
 
 async def test_atomic_transaction_with_business_tables(provider, external_conn):
     # deterministic start: business_docs is outside the VFS clean-up scope
@@ -272,7 +434,9 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
                 )
                 raise RuntimeError("abort")  # trigger rollback
         assert not await provider.exists("/tx.pdf")
-        rows = await (await external_conn.execute("SELECT COUNT(*) FROM business_docs")).fetchone()
+        rows = await (
+            await external_conn.execute("SELECT COUNT(*) FROM business_docs")
+        ).fetchone()
         assert rows[0] == 0
         await external_conn.commit()  # clear implicit tx -> next transaction() is real
 
@@ -288,7 +452,9 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
                 "INSERT INTO business_docs (name) VALUES ('tx.pdf')"
             )
         assert await provider.read_file("/tx.pdf") == b"tx-content"
-        rows = await (await external_conn.execute("SELECT COUNT(*) FROM business_docs")).fetchone()
+        rows = await (
+            await external_conn.execute("SELECT COUNT(*) FROM business_docs")
+        ).fetchone()
         assert rows[0] == 1
     finally:
         await external_conn.execute("DROP TABLE IF EXISTS business_docs")
@@ -297,6 +463,7 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
 # ----------------------------------------------------------------------
 # chuk AsyncVirtualFileSystem integration
 # ----------------------------------------------------------------------
+
 
 async def test_vfs_high_level_api(vfs):
     assert await vfs.mkdir("/projects")

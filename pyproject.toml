@@ -1,8 +1,33 @@
 [project]
 name = "vfs-pg"
-version = "0.1.0"
-description = "PostgreSQL storage provider for chuk-virtual-fs + fsspec adapter (prototype)"
+version = "0.2.0"
+description = "PostgreSQL storage provider for chuk-virtual-fs with an fsspec adapter (chuk:// protocol)"
+readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Andreas Jung" },
+]
+keywords = [
+    "vfs",
+    "virtual-filesystem",
+    "postgresql",
+    "fsspec",
+    "chuk",
+    "storage",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Filesystems",
+]
 dependencies = [
     "chuk-virtual-fs>=0.5.3",
     "fsspec>=2024.9",
@@ -10,10 +35,32 @@ dependencies = [
     "psycopg[binary]>=3.2",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "testcontainers[postgres]>=4.0",
+]
+docs = [
+    "sphinx>=8",
+    "furo>=2024.8",
+    "sphinx-autodoc-typehints>=2.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/zopyx/vfs-pg"
+Documentation = "https://github.com/zopyx/vfs-pg#readme"
+Source = "https://github.com/zopyx/vfs-pg"
+Issues = "https://github.com/zopyx/vfs-pg/issues"
+
+[project.entry-points."fsspec.specs"]
+chuk = "chuk_fsspec:ChukFileSystem"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "testcontainers[postgres]>=4.0",
 ]
 
 [build-system]
@@ -26,3 +73,11 @@ packages = ["src/chuk_vfs_postgres", "src/chuk_fsspec"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

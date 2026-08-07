@@ -10,6 +10,8 @@ PostgreSQL is only one possible backend.
     fs = fsspec.filesystem("chuk", vfs=vfs)
 """
 
+from __future__ import annotations
+
 from chuk_fsspec.fs import ChukBufferedFile, ChukFileSystem
 
 __all__ = ["ChukBufferedFile", "ChukFileSystem"]

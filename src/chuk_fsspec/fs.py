@@ -63,6 +63,7 @@ class ChukBufferedFile(AbstractBufferedFile):
         self._parts.append(self.buffer.getvalue())
         if final:
             content = b"".join(self._parts)
+            self._parts = []
             if self._append:
                 existing = (
                     self.fs.cat_file(self.path)
@@ -70,8 +71,7 @@ class ChukBufferedFile(AbstractBufferedFile):
                     else b""
                 )
                 content = existing + content
-            self.fs.pipe_file(self.path, content)
-            self._parts = []
+            self.fs.commit(self.path, content, exclusive="x" in self.mode)
 
     # reads: default AbstractBufferedFile._fetch_range calls
     # self.fs.cat_file(path, start=start, end=end) -> our async _cat_file
@@ -94,10 +94,6 @@ class ChukFileSystem(AsyncFileSystem):
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
-
-    async def _provider(self, path: str) -> Any:
-        provider, _local = self.vfs._get_provider_for_path(path)
-        return provider
 
     async def _info(self, path: str, **kwargs: Any) -> dict[str, Any]:
         node = await self.vfs.get_node_info(path)
@@ -129,14 +125,23 @@ class ChukFileSystem(AsyncFileSystem):
                 await self._info(posixpath.join(path, name))
                 for name in entries
             ]
-        return entries
+        # fsspec convention: non-detailed ls returns full paths
+        return [posixpath.join(path, name) for name in entries]
 
     async def _mkdir(self, path: str, create_parents: bool = True, **kwargs: Any) -> bool:
         parts = [p for p in path.split("/") if p]
+        if not parts:
+            return True
+        if not create_parents:
+            parent = posixpath.dirname(path) or "/"
+            if parent != "/" and not await self.vfs.exists(parent):
+                raise FileNotFoundError(parent)
         current = ""
         for part in parts:
             current = f"{current}/{part}"
             if await self.vfs.exists(current):
+                if not await self.vfs.is_dir(current):
+                    raise FileExistsError(f"not a directory: {current}")
                 continue
             if not await self.vfs.mkdir(current):
                 return False
@@ -167,10 +172,11 @@ class ChukFileSystem(AsyncFileSystem):
         return bool(await self.vfs.mv(path1, path2))
 
     async def _cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any) -> bytes:
-        provider = await self._provider(path)
+        # mount-aware: use the local path on the owning provider
+        provider, local = self.vfs._get_provider_for_path(path)
         ranger = getattr(provider, "read_range", None)
         if ranger is not None and (start is not None or end is not None):
-            data = await ranger(path, start or 0, end)
+            data = await ranger(local, start or 0, end)
             if data is None:
                 raise FileNotFoundError(path)
             return data
@@ -191,10 +197,25 @@ class ChukFileSystem(AsyncFileSystem):
                 current = f"{current}/{part}"
                 if not await self.vfs.exists(current):
                     await self.vfs.mkdir(current)
-        # vfs.write_file auto-creates the file node (touch semantics)
-        ok = await self.vfs.write_file(path, value)
+        ok = await self._commit(path, value, exclusive=False)
         if not ok:
             raise OSError(f"write failed: {path}")
+
+    async def _commit(self, path: str, content: bytes, *, exclusive: bool) -> bool:
+        """Write content, preferring the provider's atomic create-or-replace.
+
+        The postgres provider's ``write_file_atomic`` creates a missing node
+        and writes its content in one transaction (no touch round-trip) and
+        enforces ``exclusive`` with the database's unique constraint.
+        """
+        provider, local = self.vfs._get_provider_for_path(path)
+        atomic = getattr(provider, "write_file_atomic", None)
+        if atomic is not None:
+            return bool(await atomic(local, content, exclusive=exclusive))
+        # generic chuk fallback (touch semantics at the VFS level)
+        if exclusive and await self.vfs.exists(path):
+            return False
+        return bool(await self.vfs.write_file(path, content))
 
     async def _open(
         self,
