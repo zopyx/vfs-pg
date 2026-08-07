@@ -99,11 +99,49 @@ class ChukFileSystem(AsyncFileSystem):
             raise ValueError("ChukFileSystem requires a chuk AsyncVirtualFileSystem (vfs=...)")
         self.vfs = vfs
 
+    @classmethod
+    def _normalize_path(cls, path: str) -> str:
+        """Return the canonical absolute POSIX form of a VFS path."""
+        if not isinstance(path, str):
+            raise TypeError(f"path must be a string, got {type(path).__name__}")
+        if "\x00" in path:
+            raise ValueError("path must not contain NUL bytes")
+
+        parts: list[str] = []
+        for part in path.split("/"):
+            if not part or part == ".":
+                continue
+            if part == "..":
+                raise ValueError("path must not contain '..' components")
+            parts.append(part)
+        return f"/{'/'.join(parts)}" if parts else "/"
+
+    @classmethod
+    def _strip_protocol(cls, path: str | list[str]) -> str | list[str]:
+        """Strip ``chuk`` URL syntax and canonicalize the VFS path.
+
+        In a chuk URL the apparent URL authority is the first path component,
+        so both ``chuk://foo/bar`` and ``chuk:///foo/bar`` address
+        ``/foo/bar``. fsspec also calls this hook with path lists during bulk
+        operations.
+        """
+        if isinstance(path, list):
+            return [cls._strip_protocol(item) for item in path]
+        if not isinstance(path, str):
+            raise TypeError(f"path must be a string, got {type(path).__name__}")
+        if path.startswith("chuk://"):
+            path = path[len("chuk://") :]
+        elif path.startswith("chuk::"):
+            path = path[len("chuk::") :]
+        return cls._normalize_path(path)
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
 
     async def _info(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         node = await self.vfs.get_node_info(path)
         if node is None:
             raise FileNotFoundError(path)
@@ -125,6 +163,8 @@ class ChukFileSystem(AsyncFileSystem):
         }
 
     async def _ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         if not await self.vfs.exists(path):
             raise FileNotFoundError(path)
         entries = await self.vfs.ls(path)
@@ -137,6 +177,8 @@ class ChukFileSystem(AsyncFileSystem):
         return [posixpath.join(path, name) for name in entries]
 
     async def _mkdir(self, path: str, create_parents: bool = True, **kwargs: Any) -> bool:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         parts = [p for p in path.split("/") if p]
         if not parts:
             return True
@@ -156,6 +198,8 @@ class ChukFileSystem(AsyncFileSystem):
         return True
 
     async def _rm(self, path: str, recursive: bool = False, **kwargs: Any) -> bool:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         node = await self.vfs.get_node_info(path)
         if node is None:
             raise FileNotFoundError(path)
@@ -171,6 +215,9 @@ class ChukFileSystem(AsyncFileSystem):
 
     async def _cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
         """Copy a file (fsspec's mv/copy route through this)."""
+        path1 = self._strip_protocol(path1)
+        path2 = self._strip_protocol(path2)
+        assert isinstance(path1, str) and isinstance(path2, str)
         node = await self.vfs.get_node_info(path1)
         if node is None:
             raise FileNotFoundError(path1)
@@ -182,6 +229,9 @@ class ChukFileSystem(AsyncFileSystem):
         await self._pipe_file(path2, data)
 
     async def _mv(self, path1: str, path2: str, **kwargs: Any) -> bool:
+        path1 = self._strip_protocol(path1)
+        path2 = self._strip_protocol(path2)
+        assert isinstance(path1, str) and isinstance(path2, str)
         if not await self.vfs.exists(path1):
             raise FileNotFoundError(path1)
         return bool(await self.vfs.mv(path1, path2))
@@ -189,6 +239,8 @@ class ChukFileSystem(AsyncFileSystem):
     async def _cat_file(
         self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
     ) -> bytes:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         # mount-aware: use the local path on the owning provider
         provider, local = self.vfs._get_provider_for_path(path)
         ranger = getattr(provider, "read_range", None)
@@ -213,6 +265,8 @@ class ChukFileSystem(AsyncFileSystem):
         **kwargs: Any,
     ) -> None:
         """Export one VFS entry to a local path or writable file object."""
+        rpath = self._strip_protocol(rpath)
+        assert isinstance(rpath, str)
         info = await self._info(rpath)
         if info["type"] == "directory":
             if isfilelike(lpath):
@@ -279,6 +333,8 @@ class ChukFileSystem(AsyncFileSystem):
             await export_to(output)
 
     async def _pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         ok = await self._commit(path, value, exclusive=False)
         if not ok:
             raise OSError(f"write failed: {path}")
@@ -291,6 +347,8 @@ class ChukFileSystem(AsyncFileSystem):
         content in one transaction (no touch round-trip), enforcing
         ``exclusive`` with the database's unique constraint.
         """
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         parent = posixpath.dirname(path) or "/"
         if parent != "/":
             parts = [p for p in parent.split("/") if p]
@@ -319,6 +377,8 @@ class ChukFileSystem(AsyncFileSystem):
         block_size: int | str | None = None,
         **kwargs: Any,
     ) -> ChukBufferedFile:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
         if mode not in ("rb", "wb", "xb", "ab"):
             raise NotImplementedError(f"File mode not supported: {mode}")
         if mode == "xb" and await self.vfs.exists(path):
@@ -337,5 +397,25 @@ class ChukFileSystem(AsyncFileSystem):
             block_size=block_size if block_size is not None else "default",
             size=size,
             details=details,
+            **kwargs,
+        )
+
+    def mv(
+        self,
+        path1: str,
+        path2: str,
+        recursive: bool = False,
+        maxdepth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Move paths after canonicalizing both sides of fsspec's sync flow."""
+        source = self._strip_protocol(path1)
+        destination = self._strip_protocol(path2)
+        assert isinstance(source, str) and isinstance(destination, str)
+        return super().mv(
+            source,
+            destination,
+            recursive=recursive,
+            maxdepth=maxdepth,
             **kwargs,
         )

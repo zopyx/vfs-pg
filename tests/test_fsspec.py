@@ -82,6 +82,105 @@ def test_registered_protocol(fs):
     assert isinstance(chuk_fs, ChukFileSystem)
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("chuk://foo/bar", "/foo/bar"),
+        ("chuk:///foo/bar", "/foo/bar"),
+        ("chuk:////foo//./bar/", "/foo/bar"),
+        ("foo//./bar", "/foo/bar"),
+        ("/", "/"),
+        ("", "/"),
+    ],
+)
+def test_strip_protocol_returns_canonical_absolute_path(path, expected):
+    assert ChukFileSystem._strip_protocol(path) == expected
+
+
+def test_strip_protocol_handles_path_lists():
+    assert ChukFileSystem._strip_protocol(
+        ["chuk://one/file", "chuk:///two//./file"]
+    ) == ["/one/file", "/two/file"]
+
+
+def test_strip_protocol_rejects_parent_nul_and_non_string_paths():
+    with pytest.raises(ValueError, match=r"'\.\.' components"):
+        ChukFileSystem._strip_protocol("chuk://safe/../escape")
+    with pytest.raises(ValueError, match="NUL"):
+        ChukFileSystem._strip_protocol("chuk:///bad\x00path")
+    with pytest.raises(TypeError, match="path must be a string"):
+        ChukFileSystem._strip_protocol(42)  # type: ignore[arg-type]
+
+
+def test_double_and_triple_slash_urls_address_the_same_file(fs):
+    fs.pipe_file("chuk://urls/data.txt", b"canonical URL")
+
+    assert fs.cat_file("chuk:///urls/data.txt") == b"canonical URL"
+    assert fs.cat_file("/urls/data.txt") == b"canonical URL"
+    assert fs.ls("chuk://urls", detail=False) == ["/urls/data.txt"]
+    with fsspec.open("chuk://urls/data.txt", "rb", vfs=fs.vfs) as handle:
+        assert handle.read() == b"canonical URL"
+    with fsspec.open("chuk:///urls/data.txt", "rb", vfs=fs.vfs) as handle:
+        assert handle.read() == b"canonical URL"
+
+
+def test_all_path_entry_points_share_canonical_semantics(fs, tmp_path):
+    fs.mkdir("chuk://ops//./source")
+    fs.pipe_file("chuk:///ops/source//./data.bin", b"payload")
+
+    assert fs.info("ops///source/./data.bin")["name"] == "/ops/source/data.bin"
+    assert fs.ls("chuk://ops//source", detail=False) == ["/ops/source/data.bin"]
+    assert fs.cat_file("///ops/source//data.bin") == b"payload"
+    with fs.open("chuk://ops/./source/data.bin", "rb") as handle:
+        assert handle.read() == b"payload"
+
+    fs.cp("chuk:///ops/source/data.bin", "ops//./copy.bin")
+    assert fs.cat_file("/ops/copy.bin") == b"payload"
+    fs.mv("ops///copy.bin", "chuk:///ops/./moved.bin")
+    assert fs.cat_file("/ops/moved.bin") == b"payload"
+
+    destination = tmp_path / "download.bin"
+    fs.get("chuk://ops//./moved.bin", destination)
+    assert destination.read_bytes() == b"payload"
+
+    assert fs.rm("chuk:///ops//moved.bin")
+    assert not fs.exists("/ops/moved.bin")
+
+
+def test_move_of_two_equivalent_spellings_is_a_noop(fs):
+    fs.pipe_file("/same/file.txt", b"keep me")
+
+    fs.mv("chuk://same/file.txt", "chuk:///same//./file.txt")
+
+    assert fs.cat_file("/same/file.txt") == b"keep me"
+
+
+def test_all_path_entry_points_reject_parent_traversal(fs, tmp_path):
+    fs.pipe_file("/safe/source.txt", b"safe")
+    invalid = "chuk://safe/../escape.txt"
+    operations = [
+        lambda: fs.info(invalid),
+        lambda: fs.ls(invalid),
+        lambda: fs.cat_file(invalid),
+        lambda: fs.pipe_file(invalid, b"escape"),
+        lambda: fs.mkdir(invalid),
+        lambda: fs.rm(invalid),
+        lambda: fs.cp(invalid, "/copy.txt"),
+        lambda: fs.cp("/safe/source.txt", invalid),
+        lambda: fs.mv(invalid, "/moved.txt"),
+        lambda: fs.mv("/safe/source.txt", invalid),
+        lambda: fs.get(invalid, tmp_path / "escape.txt"),
+        lambda: fs.open(invalid, "rb"),
+    ]
+
+    for operation in operations:
+        with pytest.raises(ValueError, match=r"'\.\.' components"):
+            operation()
+
+    assert fs.cat_file("/safe/source.txt") == b"safe"
+    assert not fs.exists("/escape.txt")
+
+
 def test_info_and_ls(fs):
     fs.pipe_file("/projects/test/hello.txt", b"Hello")
     assert fs.exists("/projects/test/hello.txt")

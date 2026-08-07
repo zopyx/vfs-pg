@@ -131,6 +131,28 @@ async def test_path_trailing_slash_normalized(provider):
     assert await provider.exists("/f.bin/")
 
 
+async def test_relative_provider_path_is_rooted_without_dropping_first_component(provider):
+    await _mkdir(provider, "/foo")
+    await _mkfile(provider, "/foo/bar.txt")
+
+    assert await provider.write_file("foo/bar.txt", b"correct node")
+    assert await provider.read_file("foo/bar.txt") == b"correct node"
+    assert await provider.read_file("/foo/bar.txt") == b"correct node"
+    assert not await provider.exists("/bar.txt")
+
+
+async def test_repeated_separators_and_dot_components_are_canonical(provider):
+    await _mkdir(provider, "/canonical")
+    await _mkfile(provider, "/canonical/file.txt")
+
+    assert await provider.write_file("//canonical///./file.txt/", b"same file")
+    assert await provider.read_file("canonical/./file.txt") == b"same file"
+    node = await provider.get_node_info("///canonical//file.txt")
+    assert node is not None
+    assert node.parent_path == "/canonical"
+    assert node.name == "file.txt"
+
+
 async def test_list_directory_sorted(provider):
     await _mkdir(provider, "/b")
     await _mkdir(provider, "/a")
@@ -738,8 +760,23 @@ def test_split_root_path():
     assert p._split("/foo/bar") == ("/foo", "bar")
     assert p._split("foo") == ("/", "foo")
     assert p._normalize("/foo/") == "/foo"
+    assert p._normalize("foo//./bar") == "/foo/bar"
+    assert p._normalize("///foo///bar//") == "/foo/bar"
     assert p._normalize("") == "/"
     assert p._normalize("/") == "/"
+
+
+@pytest.mark.parametrize("path", ["..", "/../escape", "/safe/../escape", "safe/.."])
+def test_provider_path_rejects_parent_components(path):
+    with pytest.raises(ValueError, match=r"'\.\.' components"):
+        PostgresStorageProvider._normalize(path)
+
+
+def test_provider_path_rejects_nul_and_non_string_values():
+    with pytest.raises(ValueError, match="NUL"):
+        PostgresStorageProvider._normalize("/bad\x00path")
+    with pytest.raises(TypeError, match="path must be a string"):
+        PostgresStorageProvider._normalize(None)  # type: ignore[arg-type]
 
 
 # ----------------------------------------------------------------------

@@ -266,9 +266,26 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     @staticmethod
     def _normalize(path: str) -> str:
-        if not path or path == "/":
-            return "/"
-        return path.rstrip("/") or "/"
+        """Return the canonical absolute POSIX form of an internal VFS path.
+
+        Relative provider paths are rooted at ``/``. Empty components and
+        ``.`` are harmless spelling differences, while ``..`` is rejected
+        rather than resolved so callers can never use normalization to cross a
+        provider or mount boundary.
+        """
+        if not isinstance(path, str):
+            raise TypeError(f"path must be a string, got {type(path).__name__}")
+        if "\x00" in path:
+            raise ValueError("path must not contain NUL bytes")
+
+        parts: list[str] = []
+        for part in path.split("/"):
+            if not part or part == ".":
+                continue
+            if part == "..":
+                raise ValueError("path must not contain '..' components")
+            parts.append(part)
+        return f"/{'/'.join(parts)}" if parts else "/"
 
     def _split(self, path: str) -> tuple[str, str]:
         path = self._normalize(path)
