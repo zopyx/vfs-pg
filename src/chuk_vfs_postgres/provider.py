@@ -143,8 +143,6 @@ class PostgresStorageProvider(AsyncStorageProvider):
         asyncio lock; concurrent calls from *different* instances are
         serialized by a PostgreSQL advisory lock around schema creation.
         """
-        if self._initialized:
-            return True
         async with self._init_lock():
             if self._initialized:
                 return True
@@ -173,25 +171,28 @@ class PostgresStorageProvider(AsyncStorageProvider):
             return True
 
     async def close(self) -> None:
-        """Close the connection pool. Idempotent."""
-        if self._pool is not None:
+        """Make the provider unusable and close its owned pool.
+
+        The injected connection, when present, remains owned by the caller.
+        Lifecycle changes share the initialization lock so a concurrent
+        initialize/close pair has the state dictated by lock acquisition
+        order and cannot leave an initialized provider without a pool.
+        """
+        async with self._init_lock():
             pool = self._pool
             self._pool = None
-            try:
-                await pool.close()
-            except Exception:
-                # Loop-mismatch teardown (e.g. pytest-asyncio closing loops
-                # before fixture finalizers run): the pool's worker tasks are
-                # bound to an already-closed loop. Fall back to closing the
-                # underlying connections directly.
-                for conn in list(getattr(pool, "_pool", ())):
-                    with contextlib.suppress(Exception):
-                        await conn.close()
-        self._initialized = False
+            self._initialized = False
+            if pool is not None:
+                # Pool shutdown is best-effort so close() remains idempotent,
+                # including during event-loop teardown. Do not reach into
+                # psycopg_pool internals: connection ownership belongs to its
+                # public close() API.
+                with contextlib.suppress(Exception):
+                    await pool.close()
 
     @contextlib.asynccontextmanager
     async def _init_lock(self) -> AsyncIterator[None]:
-        """Serialize concurrent initialize() on the same instance."""
+        """Serialize lifecycle changes on the same instance."""
         lock = getattr(self, "_init_lock_obj", None)
         if lock is None:
             lock = self._init_lock_obj = asyncio.Lock()
@@ -207,8 +208,13 @@ class PostgresStorageProvider(AsyncStorageProvider):
     # connection / transaction handling
     # ------------------------------------------------------------------
 
+    def _require_initialized(self) -> None:
+        if not self._initialized:
+            raise RuntimeError("provider not initialized")
+
     @contextlib.asynccontextmanager
     async def _acquire(self) -> AsyncIterator[AsyncConnection]:
+        self._require_initialized()
         if self._external_conn is not None:
             yield self._external_conn
             return
@@ -392,6 +398,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
     async def create_node(self, node_info: EnhancedNodeInfo) -> bool:
         """Create a file or directory node. Atomic: the unique index on
         ``(parent_id, name)`` rejects duplicates even under concurrency."""
+        self._require_initialized()
         path = self._normalize(node_info.get_path())
         if path == "/":
             return False
@@ -424,6 +431,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def delete_node(self, path: str) -> bool:
         """Delete a file node or an *empty* directory node."""
+        self._require_initialized()
         path = self._normalize(path)
         if path == "/":
             return False
@@ -448,6 +456,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def get_node_info(self, path: str) -> EnhancedNodeInfo | None:
         """Return the node's metadata or None when the path does not exist."""
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
@@ -457,6 +466,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def list_directory(self, path: str) -> list[str]:
         """List child names of a directory, sorted; [] for missing/non-dirs."""
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
@@ -477,6 +487,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         Use :meth:`write_file_atomic` to create-or-replace in a single
         transaction without a separate touch round-trip.
         """
+        self._require_initialized()
         path = self._normalize(path)
         if isinstance(content, str):
             content = content.encode("utf-8")
@@ -529,6 +540,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 exists — the database uniqueness constraint guarantees this
                 even under concurrency (used for fsspec ``xb`` mode).
         """
+        self._require_initialized()
         path = self._normalize(path)
         if isinstance(content, str):
             content = content.encode("utf-8")
@@ -601,6 +613,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def read_file(self, path: str) -> bytes | None:
         """Read a file's complete content; None for missing paths/dirs."""
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
@@ -636,6 +649,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         Extension method (not part of the chuk protocol) used by the fsspec
         adapter for efficient ``seek``/partial reads.
         """
+        self._require_initialized()
         path = self._normalize(path)
         start = max(0, start)
         if end is not None and end <= start:
@@ -697,12 +711,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def exists(self, path: str) -> bool:
         """True when the path resolves to a node."""
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn:
             return await self._resolve(conn, path) is not None
 
     async def get_metadata(self, path: str) -> dict[str, Any]:
         """Return the node's jsonb metadata ({} for missing paths)."""
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn:
             row = await self._resolve(conn, path)
@@ -717,6 +733,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         concurrent updates of *different* keys never lose data. Same-key
         concurrent updates: last commit wins. Updates ``modified_at``.
         """
+        self._require_initialized()
         path = self._normalize(path)
         async with self._acquire() as conn, self._tx(conn):
             row = await self._resolve(conn, path)
@@ -743,6 +760,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         per database so concurrent moves cannot validate against the same
         stale tree and create a cycle.
         """
+        self._require_initialized()
         source = self._normalize(source)
         destination = self._normalize(destination)
         if source == "/" or destination == "/":
@@ -796,6 +814,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         self, path: str, mode: int = 0o755, owner_id: int = 1000, group_id: int = 1000
     ) -> bool:
         """Create a directory, creating missing parents (idempotent)."""
+        self._require_initialized()
         path = self._normalize(path)
         if path == "/":
             return True
@@ -834,6 +853,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def get_storage_stats(self) -> dict[str, Any]:
         """Aggregate usage statistics (dirs, files, bytes, chunks)."""
+        self._require_initialized()
         async with self._acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -858,4 +878,5 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def cleanup(self) -> dict[str, Any]:
         """No TTL/expiry support in the current version."""
+        self._require_initialized()
         return {"files_removed": 0, "bytes_freed": 0, "expired_removed": 0}

@@ -61,8 +61,11 @@ async def test_double_initialize_is_safe(provider):
 async def test_double_close_is_safe(provider):
     await provider.close()
     await provider.close()  # must not raise
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await provider.exists("/")
     # provider is usable again after re-initialize
     assert await provider.initialize() is True
+    assert await provider.exists("/")
 
 
 async def test_cleanup_is_noop(provider):
@@ -78,6 +81,36 @@ async def test_uninitialized_provider_raises(dsn):
     with pytest.raises(RuntimeError, match="not initialized"):
         await p.read_file("/x")
     await p.close()
+
+
+async def test_pooled_provider_operations_fail_after_close(dsn):
+    p = PostgresStorageProvider(dsn=dsn)
+    assert await p.initialize()
+    await p.close()
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await p.exists("/")
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await p.cleanup()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await p.create_directory("/")
+
+
+async def test_external_provider_close_requires_reinitialize(external_conn):
+    joined = PostgresStorageProvider(conn=external_conn)
+    assert await joined.initialize()
+    assert await joined.exists("/")
+
+    await joined.close()
+    assert not external_conn.closed
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await joined.exists("/")
+
+    # close() never takes ownership of the injected connection, and the same
+    # provider can explicitly rejoin it afterwards.
+    assert await (await external_conn.execute("SELECT 1")).fetchone() == (1,)
+    assert await joined.initialize()
+    assert await joined.exists("/")
 
 
 # ----------------------------------------------------------------------

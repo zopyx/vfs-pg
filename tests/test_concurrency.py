@@ -12,6 +12,7 @@ import hashlib
 import random
 from typing import Any
 
+import pytest
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
 from psycopg import AsyncConnection
 
@@ -341,3 +342,37 @@ async def test_initialize_idempotent_same_instance(dsn):
         assert await provider.exists("/")
     finally:
         await provider.close()
+
+
+async def test_close_waits_for_initialize_and_wins_when_second(dsn, monkeypatch):
+    """Lifecycle state follows lock order when initialize and close race.
+
+    Initialization enters the lifecycle lock first and pauses during schema
+    setup. close() must wait, then leave the provider consistently closed.
+    """
+    provider = PostgresStorageProvider(dsn=dsn)
+    schema_started = asyncio.Event()
+    resume_schema = asyncio.Event()
+    original_ensure_schema = provider._ensure_schema
+
+    async def _paused_ensure_schema(conn):
+        schema_started.set()
+        await resume_schema.wait()
+        await original_ensure_schema(conn)
+
+    monkeypatch.setattr(provider, "_ensure_schema", _paused_ensure_schema)
+
+    initialize = asyncio.create_task(provider.initialize())
+    await asyncio.wait_for(schema_started.wait(), timeout=2)
+    close = asyncio.create_task(provider.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+
+    resume_schema.set()
+    assert await asyncio.wait_for(initialize, timeout=10)
+    await asyncio.wait_for(close, timeout=10)
+
+    assert provider._initialized is False
+    assert provider._pool is None
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await provider.exists("/")
