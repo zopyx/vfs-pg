@@ -17,7 +17,7 @@
 - **Isolation (F-07)**: scope roots, sibling uniqueness, content, statistics,
   moves, deletes, and uploads by `filesystem_id`; test cleanup now deletes only
   its random session namespace.
-- **Release hygiene (F-08)**: enforce Ruff check and formatting, 94% coverage,
+- **Release hygiene (F-08)**: enforce Ruff check and formatting, 99% coverage,
   strict warning-free Sphinx documentation, package builds, and clean-wheel
   import/entry-point smoke tests on Python 3.12, 3.13, and 3.14. Documentation
   now describes streaming, append ordering, namespaces, and alpha limits.

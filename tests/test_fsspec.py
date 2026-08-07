@@ -12,6 +12,7 @@ import io
 import os
 import random
 import tempfile
+from uuid import uuid4
 
 import fsspec
 import pytest
@@ -863,3 +864,97 @@ def test_commit_generic_exclusive_direct(fs):
         assert result is False
     finally:
         provider.write_file_atomic = saved
+
+
+def test_buffered_file_generic_upload_and_append_fallbacks(fs, monkeypatch):
+    """Providers without staging APIs still buffer, append, and enforce ``x``."""
+    provider, _local = fs.vfs._get_provider_for_path("/")
+    for method in ("start_upload", "upload_part", "finish_upload", "abort_upload"):
+        monkeypatch.setattr(provider, method, None)
+
+    partial = ChukBufferedFile(fs, "/partial.bin", mode="wb")
+    assert partial._streaming_upload is False
+    partial._initiate_upload()
+    partial.buffer.write(b"first")
+    partial._upload_chunk(final=False)
+    assert partial._parts == [b"first"]
+    partial.closed = True
+
+    fs.pipe_file("/append.bin", b"old-")
+    appended = ChukBufferedFile(fs, "/append.bin", mode="ab")
+    appended.buffer.write(b"new")
+    appended._upload_chunk(final=True)
+    appended.closed = True
+    assert fs.cat_file("/append.bin") == b"old-new"
+
+    exclusive = ChukBufferedFile(fs, "/exclusive-race.bin", mode="xb")
+    fs.pipe_file("/exclusive-race.bin", b"winner")
+    exclusive.buffer.write(b"loser")
+    with pytest.raises(FileExistsError):
+        exclusive._upload_chunk(final=True)
+    exclusive.closed = True
+
+
+def test_buffered_file_streaming_start_part_and_finish_failures(fs, monkeypatch):
+    start_failure = ChukBufferedFile(fs, "/start-failure.bin", mode="wb")
+    monkeypatch.setattr(fs, "start_upload", lambda *args, **kwargs: None)
+    try:
+        with pytest.raises(OSError, match="could not start upload"):
+            start_failure._initiate_upload()
+    finally:
+        start_failure.closed = True
+    monkeypatch.undo()
+
+    part_failure = ChukBufferedFile(fs, "/part-failure.bin", mode="wb")
+    part_failure._initiate_upload()
+    part_failure.buffer.write(b"payload")
+    monkeypatch.setattr(fs, "upload_part", lambda *args, **kwargs: False)
+    with pytest.raises(OSError, match="upload part failed"):
+        part_failure._upload_chunk(final=False)
+    monkeypatch.undo()
+
+    finish_failure = ChukBufferedFile(fs, "/finish-failure.bin", mode="wb")
+    finish_failure._initiate_upload()
+    finish_failure.buffer.write(b"payload")
+    monkeypatch.setattr(fs, "finish_upload", lambda *args, **kwargs: False)
+    with pytest.raises(OSError, match="write failed"):
+        finish_failure._upload_chunk(final=True)
+
+
+def test_protocol_and_parent_creation_defensive_paths(fs, monkeypatch):
+    assert ChukFileSystem._strip_protocol("chuk::nested/file") == "/nested/file"
+    with pytest.raises(TypeError, match="path must be a string"):
+        ChukFileSystem._normalize_path(42)  # type: ignore[arg-type]
+
+    fs.pipe_file("/not-a-directory", b"content")
+    with pytest.raises(FileExistsError, match="not a directory"):
+        _run_async(fs, fs._ensure_parent_directories("/not-a-directory/child"))
+
+    async def _refuse_mkdir(path):
+        return False
+
+    monkeypatch.setattr(fs.vfs, "mkdir", _refuse_mkdir)
+    with pytest.raises(OSError, match="could not create parent directory"):
+        _run_async(fs, fs._ensure_parent_directories("/refused/child"))
+
+
+def test_missing_provider_upload_methods_return_fallback_values(fs, monkeypatch):
+    provider, _local = fs.vfs._get_provider_for_path("/")
+
+    monkeypatch.setattr(provider, "start_upload", None)
+    assert _run_async(fs, fs._start_upload("/fallback/new.bin")) is None
+
+    monkeypatch.setattr(provider, "upload_part", None)
+    assert _run_async(fs, fs._upload_part("/fallback/new.bin", uuid4(), b"data")) is False
+
+    monkeypatch.setattr(provider, "finish_upload", None)
+    assert (
+        _run_async(
+            fs,
+            fs._finish_upload("/fallback/new.bin", uuid4(), size=4, sha256=None),
+        )
+        is False
+    )
+
+    monkeypatch.setattr(provider, "abort_upload", None)
+    assert _run_async(fs, fs._abort_upload("/fallback/new.bin", uuid4())) is False

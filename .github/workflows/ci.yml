@@ -33,7 +33,7 @@ jobs:
         run: >-
           uv run --frozen pytest -v
           --cov=chuk_vfs_postgres --cov=chuk_fsspec
-          --cov-report=term-missing --cov-fail-under=94
+          --cov-report=term-missing --cov-fail-under=99
 
       - name: Build documentation strictly
         run: >-

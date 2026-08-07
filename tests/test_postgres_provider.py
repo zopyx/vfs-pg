@@ -1203,3 +1203,144 @@ async def test_initialize_failure_cleans_up_pool():
         assert p._initialized is False
     finally:
         await p.close()
+
+
+async def test_acquire_rejects_inconsistent_initialized_state():
+    provider = PostgresStorageProvider()
+    provider._initialized = True
+    with pytest.raises(RuntimeError, match="not initialized"):
+        async with provider._acquire():
+            pass
+
+
+async def test_schema_guard_reports_duplicate_siblings():
+    class DuplicateCursor:
+        async def execute(self, query, params=None):
+            return None
+
+        async def fetchall(self):
+            return [("tenant", "parent", "name", 2)]
+
+    provider = PostgresStorageProvider()
+    with pytest.raises(RuntimeError, match=r"tenant:parent/name \(x2\)"):
+        await provider._ensure_schema_locked(DuplicateCursor())
+
+
+def test_upload_id_validation_rejects_non_uuid_values():
+    with pytest.raises(TypeError, match="UUID or UUID string"):
+        PostgresStorageProvider._coerce_upload_id(42)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
+        PostgresStorageProvider._coerce_upload_id("not-a-uuid")
+
+
+async def test_chunk_helpers_validate_sources_and_integrity(provider, monkeypatch):
+    invalid = provider._iter_chunk_data(None, "unknown", "owner", None)
+    with pytest.raises(ValueError, match="unsupported chunk source"):
+        await anext(invalid)
+
+    async def complete_with_extra_rows(conn, table, owner_column, owner_id):
+        if table == "vfs_chunks":
+            yield b"abc"
+            yield b"ignored"
+        else:
+            yield b"d"
+            yield b"ignored"
+
+    monkeypatch.setattr(provider, "_iter_chunk_data", complete_with_extra_rows)
+    assert (
+        await provider._append_sha256(None, "node", 3, uuid4(), 1)
+        == hashlib.sha256(b"abcd").hexdigest()
+    )
+
+    async def short_existing(conn, table, owner_column, owner_id):
+        yield b"a"
+
+    monkeypatch.setattr(provider, "_iter_chunk_data", short_existing)
+    with pytest.raises(RuntimeError, match="existing file chunks are shorter"):
+        await provider._append_sha256(None, "node", 2, uuid4(), 0)
+
+    async def short_staged(conn, table, owner_column, owner_id):
+        yield b"ab" if table == "vfs_chunks" else b"c"
+
+    monkeypatch.setattr(provider, "_iter_chunk_data", short_staged)
+    with pytest.raises(RuntimeError, match="staged chunks are shorter"):
+        await provider._append_sha256(None, "node", 2, uuid4(), 2)
+
+    await provider._append_staged_chunks(None, {}, {"size": 0})
+
+
+async def test_append_rejects_missing_existing_tail(provider):
+    await _mkfile(provider, "/broken-tail.bin")
+    assert await provider.write_file("/broken-tail.bin", b"abc")
+    upload_id = await provider.start_upload("/broken-tail.bin", append=True)
+    assert await provider.upload_part(upload_id, b"d")
+
+    async with provider._acquire() as conn, provider._tx(conn):
+        node = await provider._resolve(conn, "/broken-tail.bin")
+        upload = await provider._lock_upload(conn, upload_id)
+        assert node is not None and upload is not None
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM vfs_chunks WHERE node_id = %s", (node["node_id"],))
+        with pytest.raises(RuntimeError, match="missing its final chunk"):
+            await provider._append_staged_chunks(conn, node, upload)
+
+    assert await provider.abort_upload(upload_id)
+
+
+async def test_staged_upload_validation_and_empty_part(provider, monkeypatch):
+    with pytest.raises(ValueError, match="root directory"):
+        await provider.start_upload("/")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await provider.start_upload("/invalid.bin", exclusive=True, append=True)
+
+    original_root_row = provider._root_row
+
+    async def _missing_root(conn):
+        return None
+
+    monkeypatch.setattr(provider, "_root_row", _missing_root)
+    with pytest.raises(RuntimeError, match="root node is missing"):
+        await provider.start_upload("/missing-root.bin")
+    monkeypatch.setattr(provider, "_root_row", original_root_row)
+
+    upload_id = await provider.start_upload("/empty-part.bin")
+    assert await provider.upload_part(upload_id, b"")
+    assert await provider.abort_upload(upload_id)
+
+
+async def test_corrupt_partial_upload_is_aborted(provider):
+    upload_id = await provider.start_upload("/corrupt-partial.bin")
+    assert await provider.upload_part(upload_id, b"abc")
+    async with provider._acquire() as conn, provider._tx(conn), conn.cursor() as cur:
+        await cur.execute("DELETE FROM vfs_upload_chunks WHERE upload_id = %s", (upload_id,))
+
+    with pytest.raises(RuntimeError, match="missing its partial chunk"):
+        await provider.upload_part(upload_id, b"d")
+    assert not await provider.abort_upload(upload_id)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"size": True}, "non-negative integer"),
+        ({"size": -1}, "non-negative integer"),
+        ({"sha256": "short"}, "64-character hexadecimal"),
+        ({"sha256": "g" * 64}, "64-character hexadecimal"),
+    ],
+)
+async def test_finish_upload_rejects_invalid_metadata_and_aborts(provider, kwargs, message):
+    upload_id = await provider.start_upload("/invalid-metadata.bin")
+    with pytest.raises(ValueError, match=message):
+        await provider.finish_upload(upload_id, **kwargs)
+    assert not await provider.abort_upload(upload_id)
+
+
+async def test_finish_upload_discards_directory_and_missing_parent_targets(provider):
+    directory_upload = await provider.start_upload("/target-directory")
+    assert await provider.create_directory("/target-directory")
+    assert not await provider.finish_upload(directory_upload, size=0)
+    assert not await provider.abort_upload(directory_upload)
+
+    missing_parent_upload = await provider.start_upload("/missing-parent/file.bin")
+    assert not await provider.finish_upload(missing_parent_upload, size=0)
+    assert not await provider.abort_upload(missing_parent_upload)

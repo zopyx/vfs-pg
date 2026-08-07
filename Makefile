@@ -20,7 +20,7 @@ test:
 
 test-cov:
 	$(PYTEST) --cov=chuk_vfs_postgres --cov=chuk_fsspec \
-		--cov-report=term-missing --cov-fail-under=94
+		--cov-report=term-missing --cov-fail-under=99
 
 test-cov-html: test-cov
 	$(UV) run coverage html
