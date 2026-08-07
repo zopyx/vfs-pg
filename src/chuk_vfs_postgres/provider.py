@@ -32,13 +32,12 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import psycopg
+from chuk_virtual_fs.node_info import EnhancedNodeInfo
+from chuk_virtual_fs.provider_base import AsyncStorageProvider
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-
-from chuk_virtual_fs.node_info import EnhancedNodeInfo
-from chuk_virtual_fs.provider_base import AsyncStorageProvider
 
 DEFAULT_DSN = "postgresql://vfs:vfs@localhost:5432/vfs"
 DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
@@ -244,18 +243,16 @@ class PostgresStorageProvider(AsyncStorageProvider):
             async with conn.cursor() as cur:
                 await self._ensure_schema_locked(cur)
             return
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await self._ensure_schema_locked(cur)
+        async with conn.transaction(), conn.cursor() as cur:
+            await self._ensure_schema_locked(cur)
 
     async def _ensure_schema_locked(self, cur: Any) -> None:
         await cur.execute("SELECT pg_advisory_xact_lock(83710001)")
         # migration guard: never install the sibling unique index on dirty data
-        try:
-            await cur.execute("SELECT 1 FROM vfs_nodes LIMIT 1")
-        except psycopg.errors.UndefinedTable:
-            pass  # fresh database; SCHEMA_SQL creates everything
-        else:
+        # (to_regclass -> NULL instead of an error on fresh databases, which
+        # would abort the surrounding transaction)
+        await cur.execute("SELECT to_regclass('vfs_nodes') IS NOT NULL")
+        if (await cur.fetchone())[0]:
             await cur.execute(DUPLICATE_SIBLINGS_SQL)
             dupes = await cur.fetchall()
             if dupes:
@@ -365,32 +362,31 @@ class PostgresStorageProvider(AsyncStorageProvider):
         if path == "/":
             return False
 
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                parent_row, name = await self._resolve_parent(conn, path)
-                if parent_row is None:
-                    return False
-                if not parent_row["is_dir"]:
-                    return False
-                async with conn.cursor() as cur:
-                    try:
-                        await cur.execute(
-                            """
+        async with self._acquire() as conn, self._tx(conn):
+            parent_row, name = await self._resolve_parent(conn, path)
+            if parent_row is None:
+                return False
+            if not parent_row["is_dir"]:
+                return False
+            async with conn.cursor() as cur:
+                try:
+                    await cur.execute(
+                        """
                             INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
                             VALUES (%s, %s, %s, %s)
                             """,
-                            (
-                                parent_row["node_id"],
-                                name,
-                                node_info.is_dir,
-                                "inode/directory"
-                                if node_info.is_dir
-                                else "application/octet-stream",
-                            ),
-                        )
-                    except psycopg.errors.UniqueViolation:
-                        return False  # concurrent create of the same path won
-                return True
+                        (
+                            parent_row["node_id"],
+                            name,
+                            node_info.is_dir,
+                            "inode/directory"
+                            if node_info.is_dir
+                            else "application/octet-stream",
+                        ),
+                    )
+                except psycopg.errors.UniqueViolation:
+                    return False  # concurrent create of the same path won
+            return True
 
     async def delete_node(self, path: str) -> bool:
         """Delete a file node or an *empty* directory node."""
@@ -398,24 +394,23 @@ class PostgresStorageProvider(AsyncStorageProvider):
         if path == "/":
             return False
 
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                row = await self._resolve(conn, path)
-                if row is None:
-                    return False
-                if row["is_dir"]:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "SELECT 1 FROM vfs_nodes WHERE parent_id = %s LIMIT 1",
-                            (row["node_id"],),
-                        )
-                        if await cur.fetchone():
-                            return False
+        async with self._acquire() as conn, self._tx(conn):
+            row = await self._resolve(conn, path)
+            if row is None:
+                return False
+            if row["is_dir"]:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "DELETE FROM vfs_nodes WHERE node_id = %s", (row["node_id"],)
+                        "SELECT 1 FROM vfs_nodes WHERE parent_id = %s LIMIT 1",
+                        (row["node_id"],),
                     )
-                return True
+                    if await cur.fetchone():
+                        return False
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM vfs_nodes WHERE node_id = %s", (row["node_id"],)
+                )
+            return True
 
     async def get_node_info(self, path: str) -> EnhancedNodeInfo | None:
         """Return the node's metadata or None when the path does not exist."""
@@ -458,32 +453,31 @@ class PostgresStorageProvider(AsyncStorageProvider):
             for i in range(0, len(content), self.chunk_size)
         ]
 
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                row = await self._resolve(conn, path)
-                if row is None or row["is_dir"]:
-                    return False
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
+        async with self._acquire() as conn, self._tx(conn):
+            row = await self._resolve(conn, path)
+            if row is None or row["is_dir"]:
+                return False
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
                         UPDATE vfs_nodes
                            SET size = %s, sha256 = %s, chunk_size = %s, modified_at = now()
                          WHERE node_id = %s
                         """,
-                        (len(content), sha256, self.chunk_size, row["node_id"]),
-                    )
-                    await cur.execute(
-                        "DELETE FROM vfs_chunks WHERE node_id = %s",
-                        (row["node_id"],),
-                    )
-                    await cur.executemany(
-                        "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
-                        [
-                            (row["node_id"], i, chunk)
-                            for i, chunk in enumerate(chunks)
-                        ],
-                    )
-                return True
+                    (len(content), sha256, self.chunk_size, row["node_id"]),
+                )
+                await cur.execute(
+                    "DELETE FROM vfs_chunks WHERE node_id = %s",
+                    (row["node_id"],),
+                )
+                await cur.executemany(
+                    "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
+                    [
+                        (row["node_id"], i, chunk)
+                        for i, chunk in enumerate(chunks)
+                    ],
+                )
+            return True
 
     async def write_file_atomic(
         self, path: str, content: bytes, *, exclusive: bool = False
@@ -511,53 +505,52 @@ class PostgresStorageProvider(AsyncStorageProvider):
             for i in range(0, len(content), self.chunk_size)
         ]
 
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                row = await self._resolve(conn, path)
-                if row is not None and row["is_dir"]:
-                    return False
-                if row is not None and exclusive:
-                    return False
+        async with self._acquire() as conn, self._tx(conn):
+            row = await self._resolve(conn, path)
+            if row is not None and row["is_dir"]:
+                return False
+            if row is not None and exclusive:
+                return False
 
-                if row is None:
-                    parent_row, name = await self._resolve_parent(conn, path)
-                    if parent_row is None or not parent_row["is_dir"]:
-                        return False
-                    async with conn.cursor() as cur:
-                        try:
-                            await cur.execute(
-                                """
+            if row is None:
+                parent_row, name = await self._resolve_parent(conn, path)
+                if parent_row is None or not parent_row["is_dir"]:
+                    return False
+                async with conn.cursor() as cur:
+                    try:
+                        await cur.execute(
+                            """
                                 INSERT INTO vfs_nodes (parent_id, name, is_dir)
                                 VALUES (%s, %s, false)
                                 RETURNING node_id
                                 """,
-                                (parent_row["node_id"], name),
-                            )
-                        except psycopg.errors.UniqueViolation:
-                            return False  # concurrent exclusive create won
-                        row = {"node_id": (await cur.fetchone())[0]}
+                            (parent_row["node_id"], name),
+                        )
+                    except psycopg.errors.UniqueViolation:
+                        return False  # concurrent exclusive create won
+                    row = {"node_id": (await cur.fetchone())[0]}
 
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
                         UPDATE vfs_nodes
                            SET size = %s, sha256 = %s, chunk_size = %s, modified_at = now()
                          WHERE node_id = %s
                         """,
-                        (len(content), sha256, self.chunk_size, row["node_id"]),
-                    )
-                    await cur.execute(
-                        "DELETE FROM vfs_chunks WHERE node_id = %s",
-                        (row["node_id"],),
-                    )
-                    await cur.executemany(
-                        "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
-                        [
-                            (row["node_id"], i, chunk)
-                            for i, chunk in enumerate(chunks)
-                        ],
-                    )
-                return True
+                    (len(content), sha256, self.chunk_size, row["node_id"]),
+                )
+                await cur.execute(
+                    "DELETE FROM vfs_chunks WHERE node_id = %s",
+                    (row["node_id"],),
+                )
+                await cur.executemany(
+                    "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
+                    [
+                        (row["node_id"], i, chunk)
+                        for i, chunk in enumerate(chunks)
+                    ],
+                )
+            return True
 
     async def read_file(self, path: str) -> bytes | None:
         """Read a file's complete content; None for missing paths/dirs."""
@@ -639,21 +632,20 @@ class PostgresStorageProvider(AsyncStorageProvider):
         concurrent updates: last commit wins. Updates ``modified_at``.
         """
         path = self._normalize(path)
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                row = await self._resolve(conn, path)
-                if row is None:
-                    return False
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
+        async with self._acquire() as conn, self._tx(conn):
+            row = await self._resolve(conn, path)
+            if row is None:
+                return False
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
                         UPDATE vfs_nodes
                            SET metadata = metadata || %s::jsonb, modified_at = now()
                          WHERE node_id = %s
                         """,
-                        (Jsonb(metadata), row["node_id"]),
-                    )
-                return True
+                    (Jsonb(metadata), row["node_id"]),
+                )
+            return True
 
     async def move_node(self, source: str, destination: str) -> bool:
         """Atomic rename/move: a single UPDATE on parent_id + name.
@@ -670,31 +662,30 @@ class PostgresStorageProvider(AsyncStorageProvider):
         if source == destination:
             return True
 
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                src_row = await self._resolve(conn, source)
-                if src_row is None:
-                    return False
-                dest_parent, dest_name = await self._resolve_parent(conn, destination)
-                if dest_parent is None or not dest_parent["is_dir"]:
-                    return False
-                if await self._child(conn, dest_parent["node_id"], dest_name):
-                    return False
-                if src_row["is_dir"] and await self._is_within(
-                    conn, dest_parent["node_id"], src_row["node_id"]
-                ):
-                    # destination lies inside the directory being moved
-                    return False
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
+        async with self._acquire() as conn, self._tx(conn):
+            src_row = await self._resolve(conn, source)
+            if src_row is None:
+                return False
+            dest_parent, dest_name = await self._resolve_parent(conn, destination)
+            if dest_parent is None or not dest_parent["is_dir"]:
+                return False
+            if await self._child(conn, dest_parent["node_id"], dest_name):
+                return False
+            if src_row["is_dir"] and await self._is_within(
+                conn, dest_parent["node_id"], src_row["node_id"]
+            ):
+                # destination lies inside the directory being moved
+                return False
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
                         UPDATE vfs_nodes
                            SET parent_id = %s, name = %s, modified_at = now()
                          WHERE node_id = %s
                         """,
-                        (dest_parent["node_id"], dest_name, src_row["node_id"]),
-                    )
-                return True
+                    (dest_parent["node_id"], dest_name, src_row["node_id"]),
+                )
+            return True
 
     async def create_directory(
         self, path: str, mode: int = 0o755, owner_id: int = 1000, group_id: int = 1000
@@ -706,34 +697,33 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
         parts = path.split("/")[1:]
         current = "/"
-        async with self._acquire() as conn:
-            async with self._tx(conn):
-                for name in parts:
-                    parent_row = await self._resolve(conn, current)
-                    if parent_row is None:
+        async with self._acquire() as conn, self._tx(conn):
+            for name in parts:
+                parent_row = await self._resolve(conn, current)
+                if parent_row is None:
+                    return False
+                child = await self._child(conn, parent_row["node_id"], name)
+                if child is not None:
+                    if not child["is_dir"]:
                         return False
-                    child = await self._child(conn, parent_row["node_id"], name)
-                    if child is not None:
-                        if not child["is_dir"]:
-                            return False
-                    else:
-                        async with conn.cursor() as cur:
-                            try:
-                                await cur.execute(
-                                    """
+                else:
+                    async with conn.cursor() as cur:
+                        try:
+                            await cur.execute(
+                                """
                                     INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
                                     VALUES (%s, %s, true, 'inode/directory')
                                     """,
-                                    (parent_row["node_id"], name),
-                                )
-                            except psycopg.errors.UniqueViolation:
-                                # concurrent creation of the same directory won
-                                again = await self._child(
-                                    conn, parent_row["node_id"], name
-                                )
-                                if again is None or not again["is_dir"]:
-                                    return False
-                    current = posixpath.join(current, name)
+                                (parent_row["node_id"], name),
+                            )
+                        except psycopg.errors.UniqueViolation:
+                            # concurrent creation of the same directory won
+                            again = await self._child(
+                                conn, parent_row["node_id"], name
+                            )
+                            if again is None or not again["is_dir"]:
+                                return False
+                current = posixpath.join(current, name)
         return True
 
     async def get_storage_stats(self) -> dict[str, Any]:

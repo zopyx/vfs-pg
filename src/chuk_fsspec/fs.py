@@ -21,10 +21,9 @@ from __future__ import annotations
 import posixpath
 from typing import Any
 
-from fsspec.asyn import AsyncFileSystem
-from fsspec.spec import AbstractBufferedFile
-
 from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
+from fsspec.asyn import AsyncFileSystem, sync_wrapper
+from fsspec.spec import AbstractBufferedFile
 
 DEFAULT_BLOCK_SIZE = 5 * 1024 * 1024  # 5 MiB
 
@@ -41,7 +40,7 @@ class ChukBufferedFile(AbstractBufferedFile):
 
     def __init__(
         self,
-        fs: "ChukFileSystem",
+        fs: ChukFileSystem,
         path: str,
         mode: str = "rb",
         block_size: int | str = "default",
@@ -71,7 +70,13 @@ class ChukBufferedFile(AbstractBufferedFile):
                     else b""
                 )
                 content = existing + content
-            self.fs.commit(self.path, content, exclusive="x" in self.mode)
+            ok = self.fs.commit(self.path, content, exclusive="x" in self.mode)
+            if not ok:
+                # commit-time exclusivity enforcement: the file appeared after
+                # _open() ran (or a concurrent exclusive create won)
+                if "x" in self.mode:
+                    raise FileExistsError(self.path)
+                raise OSError(f"write failed: {self.path}")
 
     # reads: default AbstractBufferedFile._fetch_range calls
     # self.fs.cat_file(path, start=start, end=end) -> our async _cat_file
@@ -162,7 +167,14 @@ class ChukFileSystem(AsyncFileSystem):
         return bool(await self.vfs.rm(path))
 
     async def _cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
-        """Copy a file (fsspec's mv routes through copy + rm)."""
+        """Copy a file (fsspec's mv/copy route through this)."""
+        node = await self.vfs.get_node_info(path1)
+        if node is None:
+            raise FileNotFoundError(path1)
+        if node.is_dir:
+            # recursive copy calls cp_file on the directory itself
+            await self.vfs.mkdir(path2)
+            return
         data = await self._cat_file(path1)
         await self._pipe_file(path2, data)
 
@@ -171,7 +183,9 @@ class ChukFileSystem(AsyncFileSystem):
             raise FileNotFoundError(path1)
         return bool(await self.vfs.mv(path1, path2))
 
-    async def _cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any) -> bytes:
+    async def _cat_file(
+        self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
+    ) -> bytes:
         # mount-aware: use the local path on the owning provider
         provider, local = self.vfs._get_provider_for_path(path)
         ranger = getattr(provider, "read_range", None)
@@ -188,15 +202,6 @@ class ChukFileSystem(AsyncFileSystem):
         return data[start:end]
 
     async def _pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
-        parent = posixpath.dirname(path) or "/"
-        if parent != "/":
-            # ensure parent chain exists
-            parts = [p for p in parent.split("/") if p]
-            current = ""
-            for part in parts:
-                current = f"{current}/{part}"
-                if not await self.vfs.exists(current):
-                    await self.vfs.mkdir(current)
         ok = await self._commit(path, value, exclusive=False)
         if not ok:
             raise OSError(f"write failed: {path}")
@@ -204,10 +209,19 @@ class ChukFileSystem(AsyncFileSystem):
     async def _commit(self, path: str, content: bytes, *, exclusive: bool) -> bool:
         """Write content, preferring the provider's atomic create-or-replace.
 
-        The postgres provider's ``write_file_atomic`` creates a missing node
-        and writes its content in one transaction (no touch round-trip) and
-        enforces ``exclusive`` with the database's unique constraint.
+        Ensures the parent chain exists (matching pipe/open semantics) and,
+        when the provider supports it, creates a missing node and writes the
+        content in one transaction (no touch round-trip), enforcing
+        ``exclusive`` with the database's unique constraint.
         """
+        parent = posixpath.dirname(path) or "/"
+        if parent != "/":
+            parts = [p for p in parent.split("/") if p]
+            current = ""
+            for part in parts:
+                current = f"{current}/{part}"
+                if not await self.vfs.exists(current):
+                    await self.vfs.mkdir(current)
         provider, local = self.vfs._get_provider_for_path(path)
         atomic = getattr(provider, "write_file_atomic", None)
         if atomic is not None:
@@ -216,6 +230,10 @@ class ChukFileSystem(AsyncFileSystem):
         if exclusive and await self.vfs.exists(path):
             return False
         return bool(await self.vfs.write_file(path, content))
+
+    # sync entry point for ChukBufferedFile._upload_chunk (sync context);
+    # fsspec only auto-generates sync wrappers for its known async_methods
+    commit = sync_wrapper(_commit)
 
     async def _open(
         self,
@@ -226,6 +244,8 @@ class ChukFileSystem(AsyncFileSystem):
     ) -> ChukBufferedFile:
         if mode not in ("rb", "wb", "xb", "ab"):
             raise NotImplementedError(f"File mode not supported: {mode}")
+        if mode == "xb" and await self.vfs.exists(path):
+            raise FileExistsError(path)
         # resolve info asynchronously (never call sync wrappers from inside
         # the event loop) and hand the size to the buffered file so it skips
         # its own (sync) fs.info() lookup

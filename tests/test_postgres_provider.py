@@ -11,7 +11,6 @@ import hashlib
 import random
 
 import pytest
-
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
 
 from chuk_vfs_postgres import PostgresStorageProvider
@@ -293,6 +292,43 @@ async def test_custom_chunk_size_provider(dsn):
         await p.close()
 
 
+async def test_invalid_chunk_size_rejected(dsn):
+    with pytest.raises(ValueError, match="positive integer"):
+        PostgresStorageProvider(dsn=dsn, chunk_size=0)
+    with pytest.raises(ValueError, match="positive integer"):
+        PostgresStorageProvider(dsn=dsn, chunk_size=-5)
+    with pytest.raises(ValueError, match="positive integer"):
+        PostgresStorageProvider(dsn=dsn, chunk_size="big")  # type: ignore[arg-type]
+
+
+async def test_chunk_size_is_per_file_self_describing(dsn):
+    """A file written with 64 KiB chunks is range-read correctly by a
+    provider configured with the default 1 MiB chunk size."""
+    writer = PostgresStorageProvider(dsn=dsn, chunk_size=64 * 1024)
+    reader = PostgresStorageProvider(dsn=dsn)
+    assert await writer.initialize()
+    assert await reader.initialize()
+    try:
+        await _mkfile(writer, "/mixed.bin")
+        content = bytes(range(256)) * 800  # 204800 B = 3.125 x 64 KiB
+        assert await writer.write_file("/mixed.bin", content)
+
+        assert await reader.read_file("/mixed.bin") == content
+        cs64 = 64 * 1024
+        for start, end in [
+            (cs64 - 5, cs64 + 5),       # writer chunk boundary
+            (2 * cs64, 2 * cs64 + 100),  # exact boundary start
+            (100_000, 150_000),          # inside writer chunk 1
+            (len(content) - 10, len(content) + 50),
+        ]:
+            assert await reader.read_range("/mixed.bin", start, end) == content[
+                start:end
+            ]
+    finally:
+        await writer.close()
+        await reader.close()
+
+
 async def test_randomized_ranges_match_read_file(provider):
     """Property-style check: read_range windows agree with read_file slices."""
     rng = random.Random(20260807)
@@ -356,6 +392,28 @@ async def test_move_protects_destination(provider):
     assert await provider.move_node("/a/nope", "/a/d2.txt") is False
     # missing destination parent
     assert await provider.move_node("/a/s.txt", "/nope/s.txt") is False
+
+
+async def test_move_onto_itself_is_idempotent(provider):
+    await _mkdir(provider, "/a")
+    await _mkfile(provider, "/a/f.txt")
+    await provider.write_file("/a/f.txt", b"x")
+    assert await provider.move_node("/a/f.txt", "/a/f.txt") is True
+    assert await provider.read_file("/a/f.txt") == b"x"
+    assert await provider.move_node("/a", "/a") is True
+
+
+async def test_move_directory_into_own_subtree_rejected(provider):
+    await _mkdir(provider, "/a")
+    await _mkdir(provider, "/a/child")
+    await _mkfile(provider, "/a/child/f.txt")
+    await provider.write_file("/a/child/f.txt", b"x")
+    # /a -> /a/child/moved would put /a inside itself
+    assert await provider.move_node("/a", "/a/child/moved") is False
+    assert await provider.move_node("/a", "/a/child") is False
+    # tree unchanged
+    assert await provider.read_file("/a/child/f.txt") == b"x"
+    assert (await provider.get_node_info("/a")).is_dir
 
 
 async def test_delete_semantics_and_cascade(provider):
@@ -458,6 +516,7 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
         assert rows[0] == 1
     finally:
         await external_conn.execute("DROP TABLE IF EXISTS business_docs")
+        await external_conn.commit()  # cleanup must persist, not roll back
 
 
 # ----------------------------------------------------------------------

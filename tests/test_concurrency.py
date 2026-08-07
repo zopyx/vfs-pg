@@ -56,6 +56,7 @@ async def test_concurrent_writes_distinct_files(dsn):
         async def _write(i: int) -> tuple[str, bytes]:
             content = rng.randbytes(512 * 1024 + i * 4096)
             path = f"/conc/f{i}.bin"
+            await _mkfile(provider, path)  # pre-create the node
             assert await provider.write_file(path, content)
             return path, content
 
@@ -106,5 +107,83 @@ async def test_concurrent_reads_never_see_partial_content(dsn):
 
         for path, content in final.items():
             assert await provider.read_file(path) == content
+    finally:
+        await provider.close()
+
+
+async def test_concurrent_duplicate_creates_single_node(dsn):
+    """The (parent_id, name) unique index guarantees exactly one node even
+    when many sessions create the same path at once."""
+    provider = PostgresStorageProvider(dsn=dsn)
+    assert await provider.initialize()
+    try:
+        await _mkdir(provider, "/dup")
+
+        async def _create() -> bool:
+            return await provider.create_node(
+                EnhancedNodeInfo(name="x.txt", is_dir=False, parent_path="/dup")
+            )
+
+        results = await asyncio.gather(*(_create() for _ in range(10)))
+        assert results.count(True) == 1
+        assert await provider.list_directory("/dup") == ["x.txt"]
+    finally:
+        await provider.close()
+
+
+async def test_concurrent_exclusive_writes_single_winner(dsn):
+    """write_file_atomic(exclusive=True) races: exactly one wins, the file
+    holds the winner's content, nobody sees a partial version."""
+    provider = PostgresStorageProvider(dsn=dsn)
+    assert await provider.initialize()
+    try:
+        await _mkdir(provider, "/excl")
+        rng = random.Random(5)
+        contents = [rng.randbytes(256 * 1024 + i) for i in range(8)]
+
+        async def _write(i: int) -> bool:
+            return await provider.write_file_atomic(
+                "/excl/race.bin", contents[i], exclusive=True
+            )
+
+        results = await asyncio.gather(*(_write(i) for i in range(8)))
+        assert results.count(True) == 1
+
+        data = await provider.read_file("/excl/race.bin")
+        assert data in contents
+        node = await provider.get_node_info("/excl/race.bin")
+        assert node is not None
+        assert node.sha256 == hashlib.sha256(data).hexdigest()
+    finally:
+        await provider.close()
+
+
+async def test_concurrent_metadata_merge_disjoint_keys(dsn):
+    """Concurrent metadata updates of different keys must not lose data
+    (atomic JSONB merge)."""
+    provider = PostgresStorageProvider(dsn=dsn)
+    assert await provider.initialize()
+    try:
+        await _mkfile(provider, "/meta.bin")
+        assert await provider.write_file("/meta.bin", b"x")
+
+        async def _set(i: int) -> bool:
+            return await provider.set_metadata("/meta.bin", {f"key_{i}": i})
+
+        results = await asyncio.gather(*(_set(i) for i in range(10)))
+        assert all(results)
+
+        meta = await provider.get_metadata("/meta.bin")
+        assert {f"key_{i}": i for i in range(10)}.items() <= meta.items()
+    finally:
+        await provider.close()
+
+
+async def test_initialize_idempotent_same_instance(dsn):
+    provider = PostgresStorageProvider(dsn=dsn)
+    assert await provider.initialize()
+    assert await provider.initialize()  # no-op
+    try:
+        assert await provider.exists("/")
     finally:
         await provider.close()

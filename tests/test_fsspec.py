@@ -12,10 +12,10 @@ import random
 
 import fsspec
 import pytest
+from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 from fsspec.asyn import get_loop
 
 from chuk_fsspec import ChukFileSystem
-from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 # register once so `fsspec.filesystem("chuk", ...)` / `fsspec.open("chuk://...")` work
 fsspec.register_implementation("chuk", ChukFileSystem)
@@ -194,8 +194,9 @@ def test_mv(fs):
 
 
 def test_mv_directory_keeps_children(fs):
+    # fsspec's sync mv is copy+rm; directories need recursive=True
     fs.pipe_file("/dir/f.txt", b"x")
-    fs.mv("/dir", "/renamed")
+    fs.mv("/dir", "/renamed", recursive=True)
     assert fs.cat_file("/renamed/f.txt") == b"x"
     assert not fs.exists("/dir")
 
@@ -214,8 +215,9 @@ def test_duplicate_mkdir_is_noop(fs):
 def test_mkdir_create_parents_false(fs):
     with pytest.raises(FileNotFoundError):
         fs.mkdir("/a/b/c", create_parents=False)
-    # with the parent present it works
+    # with the direct parent present it works
     fs.mkdir("/a")
+    fs.mkdir("/a/b")
     assert fs.mkdir("/a/b/c", create_parents=False) is True
 
 
@@ -280,17 +282,21 @@ def test_large_file_boundaries_and_streamed_read(fs):
 
 
 def test_concurrent_xb_single_winner(fs):
-    """Two racing exclusive creates: exactly one succeeds."""
+    """Two racing exclusive creates: exactly one succeeds, the other gets
+    FileExistsError (enforced by the DB unique constraint at commit time)."""
     from concurrent.futures import ThreadPoolExecutor
 
     def _create():
-        with fs.open("/race.bin", "xb") as f:
-            f.write(b"winner")
-        return True
+        try:
+            with fs.open("/race.bin", "xb") as f:
+                f.write(b"winner")
+            return True
+        except FileExistsError:
+            return False
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: _create(), range(2)))
-    assert results.count(True) == 1
+    assert sorted(results) == [False, True]
     assert fs.cat_file("/race.bin") == b"winner"
 
 

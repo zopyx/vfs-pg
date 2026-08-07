@@ -15,10 +15,9 @@ import os
 import psycopg
 import pytest
 import pytest_asyncio
-from testcontainers.postgres import PostgresContainer
+from testcontainers.community.postgres import PostgresContainer
 
 import chuk_vfs_postgres  # noqa: F401  (registers the "postgres" provider)
-
 from chuk_vfs_postgres import PostgresStorageProvider
 
 IMAGE = os.environ.get("VFS_PG_IMAGE", "postgres:16-alpine")
@@ -57,14 +56,30 @@ async def provider(dsn: str):
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def clean_db(provider):
-    """Reset the VFS tree before every test (keeps the root node)."""
-    async with provider._acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("TRUNCATE vfs_nodes CASCADE")
-            await cur.execute(
-                "INSERT INTO vfs_nodes (parent_id, name, is_dir) VALUES (NULL, '', true)"
+async def clean_db(provider, dsn: str):
+    """Reset the VFS tree before every test (keeps the root node).
+
+    Safety: when running against an externally provided database
+    (``VFS_PG_DSN``), truncation is refused unless the database name contains
+    ``test`` or ``VFS_PG_ALLOW_TRUNCATE=1`` is set explicitly — the suite
+    must never destroy data in an arbitrary database.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    env_dsn = os.environ.get("VFS_PG_DSN")
+    if env_dsn:
+        dbname = str(conninfo_to_dict(env_dsn).get("dbname") or "")
+        if "test" not in dbname and os.environ.get("VFS_PG_ALLOW_TRUNCATE") != "1":
+            pytest.fail(
+                "refusing to TRUNCATE a non-test database "
+                f"(dbname={dbname!r}). Point VFS_PG_DSN at a database whose "
+                "name contains 'test' or set VFS_PG_ALLOW_TRUNCATE=1."
             )
+    async with provider._acquire() as conn, conn.cursor() as cur:
+        await cur.execute("TRUNCATE vfs_nodes CASCADE")
+        await cur.execute(
+            "INSERT INTO vfs_nodes (parent_id, name, is_dir) VALUES (NULL, '', true)"
+        )
     yield
 
 

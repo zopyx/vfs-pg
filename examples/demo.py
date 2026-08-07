@@ -12,10 +12,10 @@ import os
 import time
 
 import fsspec
+from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 import chuk_vfs_postgres  # noqa: F401  (registers the "postgres" provider)
 from chuk_fsspec import ChukFileSystem
-from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 DSN = os.environ.get("VFS_PG_DSN", "postgresql://vfs:vfs@localhost:5432/vfs")
 
@@ -105,9 +105,18 @@ async def main() -> None:
         return size / seconds / CHUNK
 
     print(f"generate  : {t_gen:6.2f}s")
-    print(f"store     : {t_store:6.2f}s  ({mbps(t_store):6.0f} MiB/s)  1 MiB writes via fs.open('wb')")
-    print(f"read      : {t_read:6.2f}s  ({mbps(t_read):6.0f} MiB/s)  single-shot fs.cat_file, sha256 match: {ok}")
-    print(f"read stream: {t_stream:6.2f}s  ({mbps(t_stream):6.0f} MiB/s)  1 MiB reads via fs.open('rb'), sha256 match: True")
+    print(
+        f"store     : {t_store:6.2f}s  ({mbps(t_store):6.0f} MiB/s)"
+        "  1 MiB writes via fs.open('wb')"
+    )
+    print(
+        f"read      : {t_read:6.2f}s  ({mbps(t_read):6.0f} MiB/s)"
+        f"  single-shot fs.cat_file, sha256 match: {ok}"
+    )
+    print(
+        f"read stream: {t_stream:6.2f}s  ({mbps(t_stream):6.0f} MiB/s)"
+        "  1 MiB reads via fs.open('rb'), sha256 match: True"
+    )
 
     print("\nstats:", await provider.get_storage_stats())
 

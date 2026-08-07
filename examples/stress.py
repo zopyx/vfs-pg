@@ -19,10 +19,12 @@ import hashlib
 import os
 import random
 import time
-from dataclasses import dataclass
+from collections import Counter as ExcCounter
+from dataclasses import dataclass, field
+
+from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 import chuk_vfs_postgres  # noqa: F401  (registers the "postgres" provider)
-from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 DSN = os.environ.get("VFS_PG_DSN", "postgresql://vfs:vfs@localhost:5432/vfs")
 
@@ -44,13 +46,16 @@ registry_lock = asyncio.Lock()
 @dataclass
 class Counter:
     ops: int = 0
-    bytes: int = 0
+    bytes_attempted: int = 0
+    bytes_ok: int = 0
     errors: int = 0
+    exceptions: ExcCounter[str] = field(default_factory=ExcCounter)
 
 
-def _content(seed: int, size: int) -> bytes:
-    """Deterministic incompressible content (seed-based)."""
-    return random.Random(seed).randbytes(size)
+def _make_content(seed: int, size: int) -> tuple[bytes, str]:
+    """Deterministic incompressible content + its sha256 (blocking, CPU)."""
+    content = random.Random(seed).randbytes(size)
+    return content, hashlib.sha256(content).hexdigest()
 
 
 async def writer_loop(vfs, name: str, counter: Counter, deadline: float) -> None:
@@ -59,9 +64,12 @@ async def writer_loop(vfs, name: str, counter: Counter, deadline: float) -> None
         seq += 1
         size = random.randint(MIN_MB, MAX_MB) * MI
         path = f"{ROOT}/{name}_{seq:04d}.bin"
+        ok = False
         try:
-            content = _content(random.randrange(1 << 30), size)
-            sha = hashlib.sha256(content).hexdigest()
+            # generation + hashing are CPU-bound -> keep them off the loop
+            content, sha = await asyncio.to_thread(
+                _make_content, random.randrange(1 << 30), size
+            )
             ok = await vfs.write_file(path, content)
             if ok:
                 node = await vfs.get_node_info(path)
@@ -71,20 +79,28 @@ async def writer_loop(vfs, name: str, counter: Counter, deadline: float) -> None
                     registry[path] = (size, sha)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            ok = False
+        except Exception as exc:  # noqa: BLE001 - stress runs must not die
+            counter.exceptions[type(exc).__name__] += 1
         counter.ops += 1
-        counter.bytes += size
-        counter.errors += 0 if ok else 1
+        counter.bytes_attempted += size
+        if ok:
+            counter.bytes_ok += size
+        else:
+            counter.errors += 1
 
 
 async def reader_loop(vfs, provider, counter: Counter, deadline: float) -> None:
     while time.perf_counter() < deadline:
+        # never sleep while holding the lock
+        if not registry:
+            await asyncio.sleep(0.02)
+            continue
         async with registry_lock:
             if not registry:
-                await asyncio.sleep(0.02)
                 continue
             path, (size, sha) = random.choice(list(registry.items()))
+        data: bytes | None = None
+        ok = False
         try:
             if random.random() < 0.3:
                 # random range read (30% of ops)
@@ -102,12 +118,14 @@ async def reader_loop(vfs, provider, counter: Counter, deadline: float) -> None:
                 )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            data = None
-            ok = False
+        except Exception as exc:  # noqa: BLE001 - stress runs must not die
+            counter.exceptions[type(exc).__name__] += 1
         counter.ops += 1
-        counter.bytes += len(data) if data is not None else 0
-        counter.errors += 0 if ok else 1
+        counter.bytes_attempted += size
+        if ok:
+            counter.bytes_ok += len(data) if data is not None else 0
+        else:
+            counter.errors += 1
 
 
 async def main() -> None:
@@ -116,68 +134,80 @@ async def main() -> None:
     provider = vfs.provider
     assert provider is not None
 
-    await vfs.mkdir(ROOT)
-    deadline = time.perf_counter() + SECONDS
-
     w_counters = [Counter() for _ in range(WRITERS)]
     r_counters = [Counter() for _ in range(READERS)]
-    writers = [
-        asyncio.create_task(writer_loop(vfs, f"w{i}", c, deadline))
-        for i, c in enumerate(w_counters)
-    ]
-    readers = [
-        asyncio.create_task(reader_loop(vfs, provider, c, deadline))
-        for i, c in enumerate(r_counters)
-    ]
 
-    print(
-        f"=== stress: {SECONDS}s | {WRITERS} writers + {READERS} readers "
-        f"| files {MIN_MB}-{MAX_MB} MiB | run {RUN_ID} ==="
-    )
+    try:
+        await vfs.mkdir(ROOT)
+        deadline = time.perf_counter() + SECONDS
 
-    t0 = time.perf_counter()
-    while time.perf_counter() < deadline:
-        await asyncio.sleep(10)
-        elapsed = time.perf_counter() - t0
-        wb = sum(c.bytes for c in w_counters)
-        rb = sum(c.bytes for c in r_counters)
+        writers = [
+            asyncio.create_task(writer_loop(vfs, f"w{i}", c, deadline))
+            for i, c in enumerate(w_counters)
+        ]
+        readers = [
+            asyncio.create_task(reader_loop(vfs, provider, c, deadline))
+            for i, c in enumerate(r_counters)
+        ]
+
         print(
-            f"  t={elapsed:3.0f}s  write {wb / MI / elapsed:6.1f} MiB/s "
-            f"({sum(c.ops for c in w_counters):3d} ops) | "
-            f"read {rb / MI / elapsed:6.1f} MiB/s ({sum(c.ops for c in r_counters):3d} ops)"
+            f"=== stress: {SECONDS}s | {WRITERS} writers + {READERS} readers "
+            f"| files {MIN_MB}-{MAX_MB} MiB | run {RUN_ID} ==="
         )
 
-    await asyncio.gather(*writers, *readers)
-    elapsed = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        interval = min(10, max(1, SECONDS // 3))
+        while time.perf_counter() < deadline:
+            await asyncio.sleep(interval)
+            elapsed = time.perf_counter() - t0
+            wb = sum(c.bytes_ok for c in w_counters)
+            rb = sum(c.bytes_ok for c in r_counters)
+            print(
+                f"  t={elapsed:3.0f}s  write {wb / MI / elapsed:6.1f} MiB/s "
+                f"({sum(c.ops for c in w_counters):3d} ops) | "
+                f"read {rb / MI / elapsed:6.1f} MiB/s ({sum(c.ops for c in r_counters):3d} ops)"
+            )
 
-    w_ops = sum(c.ops for c in w_counters)
-    w_bytes = sum(c.bytes for c in w_counters)
-    w_err = sum(c.errors for c in w_counters)
-    r_ops = sum(c.ops for c in r_counters)
-    r_bytes = sum(c.bytes for c in r_counters)
-    r_err = sum(c.errors for c in r_counters)
+        await asyncio.gather(*writers, *readers)
+        elapsed = time.perf_counter() - t0
 
-    print("\nresults:")
-    print(
-        f"  writers : {w_ops:3d} ops, {w_bytes / MI:7.0f} MiB, "
-        f"{w_bytes / MI / elapsed:6.1f} MiB/s, {w_err} errors"
-    )
-    print(
-        f"  readers : {r_ops:3d} ops, {r_bytes / MI:7.0f} MiB, "
-        f"{r_bytes / MI / elapsed:6.1f} MiB/s, {r_err} errors"
-    )
-    print(f"  files   : {len(registry)} written, {len(await vfs.ls(ROOT))} on disk")
-    print("  storage :", await provider.get_storage_stats())
+        w_ops = sum(c.ops for c in w_counters)
+        w_ok = sum(c.bytes_ok for c in w_counters)
+        w_att = sum(c.bytes_attempted for c in w_counters)
+        w_err = sum(c.errors for c in w_counters)
+        r_ops = sum(c.ops for c in r_counters)
+        r_ok = sum(c.bytes_ok for c in r_counters)
+        r_att = sum(c.bytes_attempted for c in r_counters)
+        r_err = sum(c.errors for c in r_counters)
+        exceptions = sum((c.exceptions for c in w_counters + r_counters), ExcCounter())
 
-    # cleanup: remove this run's files, then its directory
-    names = await vfs.ls(ROOT)
-    for name in names:
-        await vfs.rm(f"{ROOT}/{name}")
-    await vfs.rm(ROOT)
-    print(f"  cleaned : removed {len(names)} files")
-    print("  storage after cleanup:", await provider.get_storage_stats())
-
-    await vfs.close()
+        print("\nresults:")
+        print(
+            f"  writers : {w_ops:3d} ops, {w_ok / MI:7.0f} MiB ok / "
+            f"{w_att / MI:7.0f} MiB attempted, {w_ok / MI / elapsed:6.1f} MiB/s, "
+            f"{w_err} errors"
+        )
+        print(
+            f"  readers : {r_ops:3d} ops, {r_ok / MI:7.0f} MiB ok / "
+            f"{r_att / MI:7.0f} MiB attempted, {r_ok / MI / elapsed:6.1f} MiB/s, "
+            f"{r_err} errors"
+        )
+        print(f"  files   : {len(registry)} written, {len(await vfs.ls(ROOT))} on disk")
+        if exceptions:
+            print("  exceptions:", dict(exceptions))
+        print("  storage :", await provider.get_storage_stats())
+    finally:
+        # cleanup runs even when the run was cancelled or crashed
+        try:
+            names = await vfs.ls(ROOT)
+            for name in names:
+                await vfs.rm(f"{ROOT}/{name}")
+            await vfs.rm(ROOT)
+            print(f"  cleaned : removed {len(names)} files")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  cleanup failed: {type(exc).__name__}: {exc}")
+        finally:
+            await vfs.close()
 
 
 if __name__ == "__main__":
