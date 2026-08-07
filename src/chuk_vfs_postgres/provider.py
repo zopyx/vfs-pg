@@ -41,6 +41,7 @@ from psycopg_pool import AsyncConnectionPool
 
 DEFAULT_DSN = "postgresql://vfs:vfs@localhost:5432/vfs"
 DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+MOVE_TOPOLOGY_LOCK_NAMESPACE = "chuk_vfs_postgres:vfs_nodes:move"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS vfs_nodes (
@@ -653,7 +654,9 @@ class PostgresStorageProvider(AsyncStorageProvider):
         Unlike the base-class copy+delete, children of a moved directory
         keep their node ids — no content is copied. Moving a directory into
         its own subtree is rejected; moving a path onto itself is an
-        idempotent success.
+        idempotent success. Topology validation and mutation are serialized
+        per database so concurrent moves cannot validate against the same
+        stale tree and create a cycle.
         """
         source = self._normalize(source)
         destination = self._normalize(destination)
@@ -663,6 +666,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
             return True
 
         async with self._acquire() as conn, self._tx(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (MOVE_TOPOLOGY_LOCK_NAMESPACE,),
+                )
+
+            # Resolve every path only after acquiring the topology lock. At
+            # READ COMMITTED this observes the preceding move's committed
+            # topology before revalidating the ancestry invariant.
             src_row = await self._resolve(conn, source)
             if src_row is None:
                 return False

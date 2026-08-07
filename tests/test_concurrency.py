@@ -7,10 +7,13 @@ was found by the stress test, plus parallel write/read access patterns.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import random
+from typing import Any
 
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
+from psycopg import AsyncConnection
 
 from chuk_vfs_postgres import PostgresStorageProvider
 
@@ -175,6 +178,81 @@ async def test_concurrent_metadata_merge_disjoint_keys(dsn):
 
         meta = await provider.get_metadata("/meta.bin")
         assert {f"key_{i}": i for i in range(10)}.items() <= meta.items()
+    finally:
+        await provider.close()
+
+
+async def test_concurrent_cross_moves_cannot_disconnect_tree(dsn, monkeypatch):
+    """Concurrent cross-moves cannot create a detached directory cycle.
+
+    The ancestry-check barrier makes the former race deterministic: without
+    move serialization both operations validate the old topology before
+    either UPDATE. With serialization, the first operation times out of the
+    barrier, commits, and the second re-resolves against the new topology.
+    """
+    provider = PostgresStorageProvider(dsn=dsn, pool_min=2, pool_max=2)
+    assert await provider.initialize()
+    try:
+        await _mkdir(provider, "/a")
+        await _mkdir(provider, "/a/d")
+        await _mkdir(provider, "/b")
+        await _mkdir(provider, "/b/c")
+
+        original_is_within = provider._is_within
+        both_validated = asyncio.Event()
+        validation_count = 0
+
+        async def _synchronized_is_within(
+            conn: AsyncConnection, node_id: Any, ancestor_id: Any
+        ) -> bool:
+            nonlocal validation_count
+            result = await original_is_within(conn, node_id, ancestor_id)
+            validation_count += 1
+            if validation_count == 2:
+                both_validated.set()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(both_validated.wait(), timeout=0.2)
+            return result
+
+        monkeypatch.setattr(provider, "_is_within", _synchronized_is_within)
+
+        start = asyncio.Event()
+
+        async def _move(source: str, destination: str) -> bool:
+            await start.wait()
+            return await provider.move_node(source, destination)
+
+        moves = [
+            asyncio.create_task(_move("/a", "/b/c/a")),
+            asyncio.create_task(_move("/b", "/a/d/b")),
+        ]
+        start.set()
+        results = await asyncio.gather(*moves)
+
+        assert sorted(results) == [False, True]
+        root_entries = await provider.list_directory("/")
+        assert root_entries in (["a"], ["b"])
+        surviving_root = root_entries[0]
+        reachable_leaf = "/a/d/b/c" if surviving_root == "a" else "/b/c/a/d"
+        assert await provider.exists(reachable_leaf)
+
+        async with provider._acquire() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                WITH RECURSIVE reachable AS (
+                    SELECT node_id FROM vfs_nodes WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT child.node_id
+                      FROM vfs_nodes child
+                      JOIN reachable parent ON child.parent_id = parent.node_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM reachable),
+                    (SELECT COUNT(*) FROM vfs_nodes)
+                """
+            )
+            reachable, total = await cur.fetchone()
+        assert reachable == total == 5
     finally:
         await provider.close()
 
