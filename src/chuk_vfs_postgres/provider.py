@@ -169,7 +169,16 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def _ensure_schema(self, conn: AsyncConnection) -> None:
         async with conn.cursor() as cur:
-            await cur.execute(SCHEMA_SQL)
+            # Concurrent initialize() calls (e.g. parallel processes starting
+            # up) deadlock on SCHEMA_SQL: CREATE TABLE IF NOT EXISTS takes a
+            # RowExclusiveLock on vfs_nodes while the root INSERT waits on the
+            # other session's lock. Serialize schema init with a session-level
+            # advisory lock (auto-released if the session dies).
+            await cur.execute("SELECT pg_advisory_lock(83710001)")
+            try:
+                await cur.execute(SCHEMA_SQL)
+            finally:
+                await cur.execute("SELECT pg_advisory_unlock(83710001)")
 
     @staticmethod
     def _normalize(path: str) -> str:
