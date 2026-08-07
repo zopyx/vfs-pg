@@ -7,15 +7,19 @@ venv/
 dist/
 build/
 
-# uv
-uv.lock
-
-# pytest
+# pytest / coverage
 .pytest_cache/
 .cache/
+.coverage
+htmlcov/
 
-# ruff
+# ruff / ty
 .ruff_cache/
+.ty_cache/
+.mypy_cache/
+
+# sphinx
+docs/_build/
 
 # env
 .env
