@@ -288,6 +288,22 @@ class PostgresStorageProvider(AsyncStorageProvider):
             )
             return await cur.fetchone()
 
+    async def _child_for_update(
+        self, conn: AsyncConnection, parent_id: Any, name: str
+    ) -> dict[str, Any] | None:
+        """Return and lock a child that another transaction may have created."""
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT *
+                  FROM vfs_nodes
+                 WHERE parent_id = %s AND name = %s
+                   FOR UPDATE
+                """,
+                (parent_id, name),
+            )
+            return await cur.fetchone()
+
     async def _root_row(self, conn: AsyncConnection) -> dict[str, Any] | None:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT * FROM vfs_nodes WHERE parent_id IS NULL")
@@ -370,24 +386,24 @@ class PostgresStorageProvider(AsyncStorageProvider):
             if not parent_row["is_dir"]:
                 return False
             async with conn.cursor() as cur:
-                try:
-                    await cur.execute(
-                        """
-                            INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
-                            VALUES (%s, %s, %s, %s)
-                            """,
-                        (
-                            parent_row["node_id"],
-                            name,
-                            node_info.is_dir,
-                            "inode/directory"
-                            if node_info.is_dir
-                            else "application/octet-stream",
-                        ),
-                    )
-                except psycopg.errors.UniqueViolation:
-                    return False  # concurrent create of the same path won
-            return True
+                await cur.execute(
+                    """
+                        INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                        DO NOTHING
+                        RETURNING node_id
+                        """,
+                    (
+                        parent_row["node_id"],
+                        name,
+                        node_info.is_dir,
+                        "inode/directory"
+                        if node_info.is_dir
+                        else "application/octet-stream",
+                    ),
+                )
+                return await cur.fetchone() is not None
 
     async def delete_node(self, path: str) -> bool:
         """Delete a file node or an *empty* directory node."""
@@ -518,18 +534,31 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 if parent_row is None or not parent_row["is_dir"]:
                     return False
                 async with conn.cursor() as cur:
-                    try:
-                        await cur.execute(
-                            """
-                                INSERT INTO vfs_nodes (parent_id, name, is_dir)
-                                VALUES (%s, %s, false)
-                                RETURNING node_id
-                                """,
-                            (parent_row["node_id"], name),
-                        )
-                    except psycopg.errors.UniqueViolation:
-                        return False  # concurrent exclusive create won
-                    row = {"node_id": (await cur.fetchone())[0]}
+                    await cur.execute(
+                        """
+                            INSERT INTO vfs_nodes (parent_id, name, is_dir)
+                            VALUES (%s, %s, false)
+                            ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                            DO NOTHING
+                            RETURNING node_id
+                            """,
+                        (parent_row["node_id"], name),
+                    )
+                    inserted = await cur.fetchone()
+
+                if inserted is not None:
+                    row = {"node_id": inserted[0]}
+                elif exclusive:
+                    return False  # concurrent exclusive create won
+                else:
+                    # ON CONFLICT waits for the winning transaction. Lock its
+                    # committed node before replacing content so this remains
+                    # a create-or-replace operation rather than a lost race.
+                    row = await self._child_for_update(
+                        conn, parent_row["node_id"], name
+                    )
+                    if row is None or row["is_dir"]:
+                        return False
 
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -728,14 +757,22 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 # destination lies inside the directory being moved
                 return False
             async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                        UPDATE vfs_nodes
-                           SET parent_id = %s, name = %s, modified_at = now()
-                         WHERE node_id = %s
-                        """,
-                    (dest_parent["node_id"], dest_name, src_row["node_id"]),
-                )
+                try:
+                    # UPDATE has no ON CONFLICT equivalent. A nested psycopg
+                    # transaction is a savepoint here, keeping a joined caller
+                    # transaction usable if a destination creator wins the
+                    # race after the existence check above.
+                    async with conn.transaction():
+                        await cur.execute(
+                            """
+                                UPDATE vfs_nodes
+                                   SET parent_id = %s, name = %s, modified_at = now()
+                                 WHERE node_id = %s
+                                """,
+                            (dest_parent["node_id"], dest_name, src_row["node_id"]),
+                        )
+                except psycopg.errors.UniqueViolation:
+                    return False
             return True
 
     async def create_directory(
@@ -759,21 +796,22 @@ class PostgresStorageProvider(AsyncStorageProvider):
                         return False
                 else:
                     async with conn.cursor() as cur:
-                        try:
-                            await cur.execute(
-                                """
-                                    INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
-                                    VALUES (%s, %s, true, 'inode/directory')
-                                    """,
-                                (parent_row["node_id"], name),
-                            )
-                        except psycopg.errors.UniqueViolation:
-                            # concurrent creation of the same directory won
-                            again = await self._child(
-                                conn, parent_row["node_id"], name
-                            )
-                            if again is None or not again["is_dir"]:
-                                return False
+                        await cur.execute(
+                            """
+                                INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
+                                VALUES (%s, %s, true, 'inode/directory')
+                                ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                                DO NOTHING
+                                RETURNING node_id
+                                """,
+                            (parent_row["node_id"], name),
+                        )
+                        inserted = await cur.fetchone()
+                    if inserted is None:
+                        # concurrent creation of the same directory won
+                        again = await self._child(conn, parent_row["node_id"], name)
+                        if again is None or not again["is_dir"]:
+                            return False
                 current = posixpath.join(current, name)
         return True
 

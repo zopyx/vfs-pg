@@ -203,6 +203,40 @@ async def test_concurrent_exclusive_writes_single_winner(dsn):
         await provider.close()
 
 
+async def test_concurrent_nonexclusive_first_writes_both_succeed(dsn, monkeypatch):
+    """A missing-file insert race remains create-or-replace for both writers."""
+    provider = PostgresStorageProvider(dsn=dsn, pool_min=2, pool_max=2)
+    assert await provider.initialize()
+    try:
+        await _mkdir(provider, "/replace")
+        target = "/replace/race.bin"
+        contents = [b"first" * 100_000, b"second" * 100_000]
+        original_resolve = provider._resolve
+        both_saw_missing = asyncio.Event()
+        missing_count = 0
+
+        async def _synchronize_missing_resolutions(conn, path):
+            nonlocal missing_count
+            row = await original_resolve(conn, path)
+            if path == target and row is None:
+                missing_count += 1
+                if missing_count == 2:
+                    both_saw_missing.set()
+                await asyncio.wait_for(both_saw_missing.wait(), timeout=2)
+            return row
+
+        monkeypatch.setattr(provider, "_resolve", _synchronize_missing_resolutions)
+
+        results = await asyncio.gather(
+            *(provider.write_file_atomic(target, content) for content in contents)
+        )
+        assert results == [True, True]
+        assert await provider.read_file(target) in contents
+        assert await provider.list_directory("/replace") == ["race.bin"]
+    finally:
+        await provider.close()
+
+
 async def test_concurrent_metadata_merge_disjoint_keys(dsn):
     """Concurrent metadata updates of different keys must not lose data
     (atomic JSONB merge)."""

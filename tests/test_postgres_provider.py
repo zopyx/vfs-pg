@@ -417,6 +417,48 @@ async def test_move_directory_into_own_subtree_rejected(provider):
     assert (await provider.get_node_info("/a")).is_dir
 
 
+async def test_move_destination_race_keeps_joined_transaction_usable(
+    provider, external_conn, monkeypatch
+):
+    """A destination created after move validation rolls back only its savepoint."""
+    await _mkfile(provider, "/source.txt")
+    await _mkdir(provider, "/destination")
+
+    joined = PostgresStorageProvider(conn=external_conn)
+    assert await joined.initialize()
+    original_child = joined._child
+    destination_checked = asyncio.Event()
+    resume_move = asyncio.Event()
+
+    async def _pause_after_destination_check(conn, parent_id, name):
+        row = await original_child(conn, parent_id, name)
+        if name == "target.txt" and row is None:
+            destination_checked.set()
+            await asyncio.wait_for(resume_move.wait(), timeout=2)
+        return row
+
+    monkeypatch.setattr(joined, "_child", _pause_after_destination_check)
+
+    async with external_conn.transaction():
+        move = asyncio.create_task(
+            joined.move_node("/source.txt", "/destination/target.txt")
+        )
+        await asyncio.wait_for(destination_checked.wait(), timeout=2)
+        assert await provider.create_node(
+            EnhancedNodeInfo(
+                name="target.txt", is_dir=False, parent_path="/destination"
+            )
+        )
+        resume_move.set()
+
+        assert await move is False
+        probe = await (await external_conn.execute("SELECT 1")).fetchone()
+        assert probe == (1,)
+
+    assert await provider.exists("/source.txt")
+    assert await provider.exists("/destination/target.txt")
+
+
 async def test_delete_semantics_and_cascade(provider):
     await _mkdir(provider, "/d")
     await _mkfile(provider, "/d/f.bin")
@@ -518,6 +560,38 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
     finally:
         await external_conn.execute("DROP TABLE IF EXISTS business_docs")
         await external_conn.commit()  # cleanup must persist, not roll back
+
+
+async def test_duplicate_create_keeps_joined_transaction_usable(provider, external_conn):
+    """Expected VFS conflicts must not abort a caller-owned transaction."""
+    await external_conn.execute("DROP TABLE IF EXISTS conflict_business_docs")
+    await external_conn.execute(
+        "CREATE TABLE conflict_business_docs (id serial PRIMARY KEY, name text)"
+    )
+    await external_conn.commit()
+
+    node = EnhancedNodeInfo(name="duplicate.txt", is_dir=False, parent_path="/")
+    try:
+        async with external_conn.transaction():
+            joined = PostgresStorageProvider(conn=external_conn)
+            await joined.initialize()
+            assert await joined.create_node(node) is True
+            assert await joined.create_node(node) is False
+
+            probe = await (await external_conn.execute("SELECT 1")).fetchone()
+            assert probe == (1,)
+            await external_conn.execute(
+                "INSERT INTO conflict_business_docs (name) VALUES ('committed')"
+            )
+
+        count = await (
+            await external_conn.execute("SELECT COUNT(*) FROM conflict_business_docs")
+        ).fetchone()
+        assert count == (1,)
+        assert await provider.exists("/duplicate.txt")
+    finally:
+        await external_conn.execute("DROP TABLE IF EXISTS conflict_business_docs")
+        await external_conn.commit()
 
 
 # ----------------------------------------------------------------------
