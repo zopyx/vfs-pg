@@ -31,6 +31,7 @@ Schema
     vfs_nodes                          vfs_chunks
     ─────────────────────────          ─────────────────────────
     node_id     uuid PK                node_id  uuid FK -> vfs_nodes
+    filesystem_id text
     parent_id   uuid FK -> node        chunk_no int
     name        text                   data     bytea
     is_dir      bool                   PK (node_id, chunk_no)
@@ -43,10 +44,14 @@ Schema
 
 - **``parent_id + name`` instead of a full path column**: rename/move is a
   single ``UPDATE`` — no content copies, no path rewrites.
-- **Unique index on ``(parent_id, name)``** (non-root rows): the filesystem
-  invariant "no duplicate siblings" is enforced by the database. A
-  migration guard refuses to install the index while duplicates exist.
-- **Partial unique index** guarantees exactly one root per database.
+- **Unique index on ``(filesystem_id, parent_id, name)``** (non-root rows):
+  the filesystem invariant "no duplicate siblings" is enforced per namespace.
+  A migration guard refuses to install the index while duplicates exist.
+- **Partial unique index on ``filesystem_id``** guarantees exactly one root per
+  namespace. Existing rows migrate to the ``default`` namespace.
+- **Namespace-scoped operations** resolve paths from the current root and scope
+  statistics, content reads, topology changes, and staging-upload tokens to the
+  provider's ``filesystem_id``.
 - **Chunk size is persisted per file**: ``read_range()`` uses the writer's
   chunk size, so any provider instance can read any file correctly.
 

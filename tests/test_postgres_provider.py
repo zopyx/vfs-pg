@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
+from uuid import uuid4
 
+import psycopg
 import pytest
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
+from psycopg import sql
 
 from chuk_vfs_postgres import PostgresStorageProvider
 
@@ -52,6 +55,210 @@ async def test_get_storage_stats(provider):
     assert stats["file_count"] == 0
     assert stats["total_size_bytes"] == 0
     assert stats["chunk_count"] == 0
+
+
+def test_filesystem_id_defaults_and_validation(monkeypatch):
+    monkeypatch.delenv("VFS_PG_FILESYSTEM_ID", raising=False)
+    assert PostgresStorageProvider().filesystem_id == "default"
+
+    monkeypatch.setenv("VFS_PG_FILESYSTEM_ID", "from-environment")
+    assert PostgresStorageProvider().filesystem_id == "from-environment"
+    assert PostgresStorageProvider(filesystem_id="explicit").filesystem_id == "explicit"
+
+    for invalid in ("", "   ", 42):
+        with pytest.raises(ValueError, match="non-empty string"):
+            PostgresStorageProvider(filesystem_id=invalid)  # type: ignore[arg-type]
+
+
+async def test_schema_namespace_indexes_and_default_migration(provider, dsn):
+    async def definitions_and_oids():
+        async with provider._acquire() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT c.relname, c.oid, pg_get_indexdef(c.oid)
+                  FROM pg_class c
+                 WHERE c.oid IN (
+                    to_regclass('uq_vfs_nodes_root'),
+                    to_regclass('uq_vfs_nodes_sibling')
+                 )
+                 ORDER BY c.relname
+                """
+            )
+            indexes = {name: (oid, definition) for name, oid, definition in await cur.fetchall()}
+            await cur.execute(
+                """
+                SELECT column_default, is_nullable
+                  FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'vfs_nodes'
+                   AND column_name = 'filesystem_id'
+                """
+            )
+            column = await cur.fetchone()
+        return indexes, column
+
+    before, column = await definitions_and_oids()
+    assert column == ("'default'::text", "NO")
+    assert "(filesystem_id) WHERE (parent_id IS NULL)" in before[
+        "uq_vfs_nodes_root"
+    ][1]
+    assert "(filesystem_id, parent_id, name) WHERE (parent_id IS NOT NULL)" in before[
+        "uq_vfs_nodes_sibling"
+    ][1]
+
+    # A fresh provider performs schema initialization again. Correct indexes
+    # keep their OIDs instead of being dropped and recreated on every call.
+    again = PostgresStorageProvider(dsn=dsn)
+    assert await again.initialize()
+    try:
+        after, _ = await definitions_and_oids()
+    finally:
+        await again.close()
+    assert {name: value[0] for name, value in after.items()} == {
+        name: value[0] for name, value in before.items()
+    }
+
+
+async def test_legacy_schema_rows_migrate_into_default_namespace(dsn):
+    """A pre-namespace tree remains visible through the default provider."""
+    schema = f"vfs_migration_{uuid4().hex}"
+    conn = await psycopg.AsyncConnection.connect(dsn)
+    try:
+        async with conn.transaction():
+            await conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+            await conn.execute(
+                sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(schema))
+            )
+            await conn.execute(
+                """
+                CREATE TABLE vfs_nodes (
+                    node_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    parent_id uuid REFERENCES vfs_nodes(node_id) ON DELETE CASCADE,
+                    name text NOT NULL,
+                    is_dir boolean NOT NULL DEFAULT false,
+                    size bigint NOT NULL DEFAULT 0,
+                    chunk_size integer NOT NULL DEFAULT 1048576,
+                    mime_type text NOT NULL DEFAULT 'application/octet-stream',
+                    sha256 text,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    modified_at timestamptz NOT NULL DEFAULT now(),
+                    metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+                );
+                CREATE UNIQUE INDEX uq_vfs_nodes_root
+                    ON vfs_nodes ((parent_id IS NULL)) WHERE parent_id IS NULL;
+                CREATE UNIQUE INDEX uq_vfs_nodes_sibling
+                    ON vfs_nodes (parent_id, name) WHERE parent_id IS NOT NULL;
+                WITH root AS (
+                    INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
+                    VALUES (NULL, '', true, 'inode/directory')
+                    RETURNING node_id
+                )
+                INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
+                SELECT node_id, 'legacy', true, 'inode/directory' FROM root;
+                """
+            )
+
+            default = PostgresStorageProvider(conn=conn, filesystem_id="default")
+            tenant = PostgresStorageProvider(conn=conn, filesystem_id="new-tenant")
+            assert await default.initialize()
+            assert await tenant.initialize()
+            try:
+                assert await default.exists("/legacy")
+                assert not await tenant.exists("/legacy")
+                assert await tenant.exists("/")
+                rows = await (
+                    await conn.execute(
+                        """
+                        SELECT filesystem_id, COUNT(*)
+                          FROM vfs_nodes
+                         GROUP BY filesystem_id
+                         ORDER BY filesystem_id
+                        """
+                    )
+                ).fetchall()
+                assert rows == [("default", 2), ("new-tenant", 1)]
+            finally:
+                await default.close()
+                await tenant.close()
+
+            # The entire migration fixture lives in its own schema. Remove
+            # only that schema before committing the test transaction.
+            await conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+    finally:
+        await conn.close()
+
+
+async def test_filesystem_namespaces_isolate_paths_stats_and_uploads(dsn):
+    marker = f"namespace-{uuid4()}"
+    first_id = f"{marker}-first"
+    second_id = f"{marker}-second"
+    first = PostgresStorageProvider(dsn=dsn, filesystem_id=first_id, chunk_size=4)
+    second = PostgresStorageProvider(dsn=dsn, filesystem_id=second_id, chunk_size=4)
+    assert await first.initialize()
+    assert await second.initialize()
+    try:
+        assert await first.create_directory("/same")
+        assert await second.create_directory("/same")
+        assert await first.write_file_atomic("/same/data.bin", b"one")
+        assert await second.write_file_atomic("/same/data.bin", b"second!")
+        assert await first.set_metadata("/same/data.bin", {"tenant": "first"})
+        assert await second.set_metadata("/same/data.bin", {"tenant": "second"})
+
+        assert await first.read_file("/same/data.bin") == b"one"
+        assert await second.read_file("/same/data.bin") == b"second!"
+        assert await first.get_metadata("/same/data.bin") == {"tenant": "first"}
+        assert await second.get_metadata("/same/data.bin") == {"tenant": "second"}
+        assert (await first.get_storage_stats())["total_size_bytes"] == 3
+        assert (await second.get_storage_stats())["total_size_bytes"] == 7
+        assert (await first.get_storage_stats())["chunk_count"] == 1
+        assert (await second.get_storage_stats())["chunk_count"] == 2
+
+        assert await first.move_node("/same/data.bin", "/same/moved.bin")
+        assert not await first.exists("/same/data.bin")
+        assert await second.read_file("/same/data.bin") == b"second!"
+        assert await second.delete_node("/same/data.bin")
+        assert await first.read_file("/same/moved.bin") == b"one"
+
+        first_upload = await first.start_upload("/staged.bin")
+        second_upload = await second.start_upload("/staged.bin")
+        assert not await second.upload_part(first_upload, b"cross-namespace")
+        assert not await second.finish_upload(first_upload)
+        assert not await second.abort_upload(first_upload)
+        assert await first.upload_part(first_upload, b"a")
+        assert await second.upload_part(second_upload, b"bb")
+
+        async with first._acquire() as conn, first._tx(conn), conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE vfs_uploads
+                   SET created_at = now() - interval '25 hours'
+                 WHERE upload_id IN (%s, %s)
+                """,
+                (first_upload, second_upload),
+            )
+
+        assert await first.cleanup() == {
+            "files_removed": 0,
+            "bytes_freed": 1,
+            "expired_removed": 1,
+        }
+        assert not await first.abort_upload(first_upload)
+        assert await second.upload_part(second_upload, b"!")
+        assert await second.finish_upload(second_upload, size=3)
+        assert await second.read_file("/staged.bin") == b"bb!"
+        assert await first.delete_node("/same/moved.bin")
+        assert await second.read_file("/staged.bin") == b"bb!"
+    finally:
+        async with first._acquire() as conn, first._tx(conn), conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM vfs_nodes
+                 WHERE filesystem_id IN (%s, %s) AND parent_id IS NULL
+                """,
+                (first_id, second_id),
+            )
+        await first.close()
+        await second.close()
 
 
 async def test_double_initialize_is_safe(provider):
@@ -784,10 +991,13 @@ async def test_staged_upload_parts_cross_chunk_boundaries(dsn):
         async with p._acquire() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT chunk_no, data FROM vfs_upload_chunks
-                 WHERE upload_id = %s ORDER BY chunk_no
+                SELECT c.chunk_no, c.data FROM vfs_upload_chunks c
+                JOIN vfs_uploads u ON u.upload_id = c.upload_id
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                 WHERE c.upload_id = %s AND root.filesystem_id = %s
+                 ORDER BY c.chunk_no
                 """,
-                (upload_id,),
+                (upload_id, p.filesystem_id),
             )
             assert await cur.fetchall() == [(0, b"abcd"), (1, b"efgh")]
 
@@ -797,9 +1007,24 @@ async def test_staged_upload_parts_cross_chunk_boundaries(dsn):
         )
         assert await p.read_file("/staged.bin") == content
         async with p._acquire() as conn, conn.cursor() as cur:
-            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_uploads u
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (p.filesystem_id,),
+            )
             assert await cur.fetchone() == (0,)
-            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_upload_chunks c
+                JOIN vfs_uploads u ON u.upload_id = c.upload_id
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (p.filesystem_id,),
+            )
             assert await cur.fetchone() == (0,)
     finally:
         await p.close()
@@ -820,7 +1045,14 @@ async def test_abort_and_failed_finish_leave_target_unchanged(provider):
     assert await provider.read_file("/keep.bin") == b"old"
 
     async with provider._acquire() as conn, conn.cursor() as cur:
-        await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+        await cur.execute(
+            """
+            SELECT COUNT(*) FROM vfs_uploads u
+            JOIN vfs_nodes root ON root.node_id = u.root_id
+            WHERE root.filesystem_id = %s
+            """,
+            (provider.filesystem_id,),
+        )
         assert await cur.fetchone() == (0,)
 
 
@@ -874,8 +1106,14 @@ async def test_cleanup_removes_only_stale_staging_uploads(provider):
     assert await provider.upload_part(fresh, b"fresh")
     async with provider._acquire() as conn, conn.cursor() as cur:
         await cur.execute(
-            "UPDATE vfs_uploads SET created_at = now() - interval '25 hours' WHERE upload_id = %s",
-            (stale,),
+            """
+            UPDATE vfs_uploads u
+               SET created_at = now() - interval '25 hours'
+              FROM vfs_nodes root
+             WHERE u.upload_id = %s AND root.node_id = u.root_id
+               AND root.filesystem_id = %s
+            """,
+            (stale, provider.filesystem_id),
         )
 
     assert await provider.cleanup() == {

@@ -2,8 +2,9 @@ Testing
 =======
 
 The test suite runs against a **throwaway PostgreSQL server started by
-testcontainers** (``postgres:16-alpine``) — no docker-compose, no manual
-setup, and no risk to existing databases.
+testcontainers** (``postgres:16-alpine``) — no docker-compose or manual setup.
+A random ``VFS_PG_FILESYSTEM_ID`` isolates every test session, including
+sessions pointed at an existing shared database.
 
 .. code-block:: bash
 
@@ -16,10 +17,12 @@ setup, and no risk to existing databases.
 Safety
 ------
 
-- The ``clean_db`` fixture truncates the VFS tables before every test.
-  When an external database is supplied via ``VFS_PG_DSN``, truncation is
-  **refused** unless the database name contains ``test`` or
-  ``VFS_PG_ALLOW_TRUNCATE=1`` is set explicitly.
+- The ``clean_db`` fixture deletes only the current session namespace's root
+  children and staging uploads. It never uses ``TRUNCATE`` and never examines
+  the database name to infer safety.
+- Session teardown deletes the random test root, cascading only that
+  namespace's nodes, chunks, and uploads. ``VFS_PG_ALLOW_TRUNCATE`` is not
+  needed when using ``VFS_PG_DSN``.
 - The container image can be changed with ``VFS_PG_IMAGE``.
 
 Suite layout

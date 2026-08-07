@@ -249,9 +249,24 @@ async def test_concurrent_staged_exclusive_losers_are_cleaned(dsn):
         assert results.count(True) == 1
         assert await provider.read_file("/staged-race.bin") in contents
         async with provider._acquire() as conn, conn.cursor() as cur:
-            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_uploads u
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (provider.filesystem_id,),
+            )
             assert await cur.fetchone() == (0,)
-            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_upload_chunks c
+                JOIN vfs_uploads u ON u.upload_id = c.upload_id
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (provider.filesystem_id,),
+            )
             assert await cur.fetchone() == (0,)
     finally:
         await provider.close()
@@ -403,16 +418,23 @@ async def test_concurrent_cross_moves_cannot_disconnect_tree(dsn, monkeypatch):
             await cur.execute(
                 """
                 WITH RECURSIVE reachable AS (
-                    SELECT node_id FROM vfs_nodes WHERE parent_id IS NULL
+                    SELECT node_id FROM vfs_nodes
+                     WHERE filesystem_id = %s AND parent_id IS NULL
                     UNION ALL
                     SELECT child.node_id
                       FROM vfs_nodes child
                       JOIN reachable parent ON child.parent_id = parent.node_id
+                     WHERE child.filesystem_id = %s
                 )
                 SELECT
                     (SELECT COUNT(*) FROM reachable),
-                    (SELECT COUNT(*) FROM vfs_nodes)
-                """
+                    (SELECT COUNT(*) FROM vfs_nodes WHERE filesystem_id = %s)
+                """,
+                (
+                    provider.filesystem_id,
+                    provider.filesystem_id,
+                    provider.filesystem_id,
+                ),
             )
             reachable, total = await cur.fetchone()
         assert reachable == total == 5

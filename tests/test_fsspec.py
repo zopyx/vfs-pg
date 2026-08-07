@@ -257,9 +257,24 @@ def test_open_multiblock_uses_staging_without_retaining_parts(fs):
 
     async def _staging_counts():
         async with provider._acquire() as conn, conn.cursor() as cur:
-            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_uploads u
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (provider.filesystem_id,),
+            )
             uploads = (await cur.fetchone())[0]
-            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_upload_chunks c
+                JOIN vfs_uploads u ON u.upload_id = c.upload_id
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (provider.filesystem_id,),
+            )
             chunks = (await cur.fetchone())[0]
         return uploads, chunks
 
@@ -288,7 +303,14 @@ def test_staged_upload_aborts_when_with_block_raises(fs):
 
     async def _upload_count():
         async with provider._acquire() as conn, conn.cursor() as cur:
-            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM vfs_uploads u
+                JOIN vfs_nodes root ON root.node_id = u.root_id
+                WHERE root.filesystem_id = %s
+                """,
+                (provider.filesystem_id,),
+            )
             return (await cur.fetchone())[0]
 
     assert _run_async(fs, _upload_count()) == 0

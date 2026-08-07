@@ -31,7 +31,8 @@ PostgreSQL 13+ (testcontainers / docker compose)
 |---|---|
 | **Chunked storage** | Files stored in fixed-size chunks (1 MiB default, **persisted per file**) — range reads touch only the overlapping chunks; any provider instance can read any file |
 | **Atomic transactions** | Provider joins an existing connection → filesystem + business rows commit or roll back together |
-| **DB-enforced integrity** | Unique index `(parent_id, name)` makes duplicate siblings impossible; fsspec `xb` exclusivity is enforced by the database, not a preflight check |
+| **Tenant namespaces** | Multiple isolated filesystems share one database via `filesystem_id`; identical paths, metadata, usage statistics, moves, deletes, and staging uploads stay independent |
+| **DB-enforced integrity** | Unique index `(filesystem_id, parent_id, name)` makes duplicate siblings impossible within a namespace; fsspec `xb` exclusivity is enforced by the database, not a preflight check |
 | **fsspec integration** | `chuk://` protocol via `fsspec.specs` entry point: `pipe`/`cat`, buffered `open` (wb/rb/ab/xb) with seek + range reads, `mv`/`cp`/`rm`, `mkdir` |
 | **Concurrency-safe init** | Schema creation serialized via `pg_advisory_xact_lock`; `initialize()` idempotent, failure-safe |
 | **Atomic metadata** | JSONB merge in a single SQL expression — concurrent updates of different keys never lose data |
@@ -59,7 +60,9 @@ from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
 
 async def main():
     vfs = AsyncVirtualFileSystem(
-        "postgres", dsn="postgresql://vfs:vfs@localhost:5432/vfs"
+        "postgres",
+        dsn="postgresql://vfs:vfs@localhost:5432/vfs",
+        filesystem_id="customer-123",
     )
     await vfs.initialize()
 
@@ -77,6 +80,10 @@ async def main():
 
 asyncio.run(main())
 ```
+
+``filesystem_id`` defaults to ``VFS_PG_FILESYSTEM_ID`` and then to
+``"default"``. Existing database rows are migrated into the ``default``
+namespace.
 
 ### Atomic transaction with business tables
 
@@ -150,10 +157,12 @@ uv sync --extra test
 uv run pytest -v
 ```
 
-Against an existing server: `VFS_PG_DSN=postgresql://user:pass@host:5432/testdb uv run pytest -v`
-(truncation of non-`test` databases is refused unless `VFS_PG_ALLOW_TRUNCATE=1`).
+Against an existing server:
+`VFS_PG_DSN=postgresql://user:pass@host:5432/database uv run pytest -v`.
+Each session uses a random filesystem namespace and deletes only that namespace,
+so the suite never truncates shared tables or requires a specially named database.
 
-67 tests cover the full provider API, the sync fsspec contract (including
+The test suite covers the full provider API, the sync fsspec contract (including
 chunk/block boundary ranges and `xb` races), and concurrency guarantees
 (deadlock regression, duplicate-create races, atomicity under concurrent
 reads). See `docs/testing.rst` and `tasks.md` (acceptance criteria with

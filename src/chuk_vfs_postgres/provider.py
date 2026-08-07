@@ -5,6 +5,7 @@ Schema design (per the chuk architecture discussion):
     vfs_nodes                  vfs_chunks
     ──────────────────         ──────────────────────
     node_id     uuid PK        node_id  uuid FK -> vfs_nodes
+    filesystem_id text
     parent_id   uuid FK        chunk_no int
     name        text           data     bytea
     is_dir      bool           PK (node_id, chunk_no)
@@ -17,9 +18,10 @@ Nodes are linked via ``parent_id + name`` (proper filesystem semantics:
 rename/move is a single UPDATE, no path rewriting). File content is stored
 in fixed-size chunks; the chunk size is persisted per file so range reads
 always use the size the file was written with, independent of the reading
-provider instance's configuration. A unique index on ``(parent_id, name)``
-enforces sibling uniqueness at the database level, so concurrent creates
-of the same path can never produce duplicate nodes.
+provider instance's configuration. A unique index on
+``(filesystem_id, parent_id, name)`` enforces sibling uniqueness at the
+database level, so concurrent creates of the same path can never produce
+duplicate nodes within a namespace.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 import posixpath
 from collections.abc import AsyncIterator
 from typing import Any
@@ -45,9 +48,10 @@ DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 UPLOAD_TTL_SECONDS = 24 * 60 * 60  # abandoned staging uploads live for at most one day
 MOVE_TOPOLOGY_LOCK_NAMESPACE = "chuk_vfs_postgres:vfs_nodes:move"
 
-SCHEMA_SQL = """
+SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS vfs_nodes (
     node_id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    filesystem_id text NOT NULL DEFAULT 'default',
     parent_id   uuid REFERENCES vfs_nodes(node_id) ON DELETE CASCADE,
     name        text NOT NULL,
     is_dir      boolean NOT NULL DEFAULT false,
@@ -62,17 +66,8 @@ CREATE TABLE IF NOT EXISTS vfs_nodes (
 
 -- migration for pre-0.2.0 databases
 ALTER TABLE vfs_nodes ADD COLUMN IF NOT EXISTS chunk_size integer NOT NULL DEFAULT 1048576;
-
--- one root per database
-CREATE UNIQUE INDEX IF NOT EXISTS uq_vfs_nodes_root
-    ON vfs_nodes ((parent_id IS NULL)) WHERE parent_id IS NULL;
-
--- no duplicate siblings (filesystem invariant, enforced by the database)
-CREATE UNIQUE INDEX IF NOT EXISTS uq_vfs_nodes_sibling
-    ON vfs_nodes (parent_id, name) WHERE parent_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_vfs_nodes_parent
-    ON vfs_nodes (parent_id);
+-- migration for databases created before filesystem namespaces
+ALTER TABLE vfs_nodes ADD COLUMN IF NOT EXISTS filesystem_id text NOT NULL DEFAULT 'default';
 
 CREATE TABLE IF NOT EXISTS vfs_chunks (
     node_id   uuid NOT NULL REFERENCES vfs_nodes(node_id) ON DELETE CASCADE,
@@ -102,19 +97,63 @@ CREATE TABLE IF NOT EXISTS vfs_upload_chunks (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (upload_id, chunk_no)
 );
-
-INSERT INTO vfs_nodes (parent_id, name, is_dir)
-SELECT NULL, '', true
-WHERE NOT EXISTS (SELECT 1 FROM vfs_nodes WHERE parent_id IS NULL);
 """
+
+# The two named indexes existed before filesystem namespaces. PostgreSQL's
+# ``IF NOT EXISTS`` only checks the name, so replace an old definition once
+# while preserving the OID of an already-correct index on later initialize().
+INDEX_MIGRATION_SQL = """
+DO $migration$
+BEGIN
+    IF to_regclass('uq_vfs_nodes_root') IS NOT NULL
+       AND pg_get_indexdef(to_regclass('uq_vfs_nodes_root'))
+           NOT LIKE '%(filesystem_id) WHERE (parent_id IS NULL)%'
+    THEN
+        DROP INDEX uq_vfs_nodes_root;
+    END IF;
+
+    IF to_regclass('uq_vfs_nodes_sibling') IS NOT NULL
+       AND pg_get_indexdef(to_regclass('uq_vfs_nodes_sibling'))
+           NOT LIKE '%(filesystem_id, parent_id, name) WHERE (parent_id IS NOT NULL)%'
+    THEN
+        DROP INDEX uq_vfs_nodes_sibling;
+    END IF;
+END
+$migration$;
+"""
+
+SCHEMA_INDEXES_SQL = """
+-- one root per filesystem namespace
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vfs_nodes_root
+    ON vfs_nodes (filesystem_id) WHERE parent_id IS NULL;
+
+-- no duplicate siblings within a filesystem namespace
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vfs_nodes_sibling
+    ON vfs_nodes (filesystem_id, parent_id, name) WHERE parent_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_vfs_nodes_parent
+    ON vfs_nodes (parent_id);
+"""
+
+# Public compatibility export: callers that execute the schema constant still
+# receive the historical default root. Provider initialization executes its
+# root statement separately because the active namespace must be parameterized.
+DEFAULT_ROOT_SQL = """
+INSERT INTO vfs_nodes (filesystem_id, parent_id, name, is_dir)
+VALUES ('default', NULL, '', true)
+ON CONFLICT (filesystem_id) WHERE parent_id IS NULL DO NOTHING;
+"""
+SCHEMA_SQL = (
+    SCHEMA_TABLES_SQL + INDEX_MIGRATION_SQL + SCHEMA_INDEXES_SQL + DEFAULT_ROOT_SQL
+)
 
 # detects existing duplicate siblings before the unique index is installed
 DUPLICATE_SIBLINGS_SQL = """
-SELECT p.name AS parent, c.name AS name, COUNT(*) AS n
+SELECT c.filesystem_id, p.name AS parent, c.name AS name, COUNT(*) AS n
   FROM vfs_nodes c
   JOIN vfs_nodes p ON p.node_id = c.parent_id
  WHERE c.parent_id IS NOT NULL
- GROUP BY c.parent_id, c.name, p.name
+ GROUP BY c.filesystem_id, c.parent_id, c.name, p.name
 HAVING COUNT(*) > 1
 """
 
@@ -131,6 +170,9 @@ class PostgresStorageProvider(AsyncStorageProvider):
         conn: an existing async connection to join (transaction-join mode).
         chunk_size: file chunk size in bytes (positive integer). The value is
             persisted per file; readers always use the writer's chunk size.
+        filesystem_id: namespace stored with every node. Defaults to
+            ``VFS_PG_FILESYSTEM_ID`` or ``"default"`` when the environment
+            variable is unset.
         pool_min / pool_max: connection pool size bounds.
     """
 
@@ -139,6 +181,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
         dsn: str | None = None,
         conn: AsyncConnection | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
+        filesystem_id: str | None = None,
         pool_min: int = 1,
         pool_max: int = 10,
     ) -> None:
@@ -147,9 +190,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
             dsn = DEFAULT_DSN
         if not isinstance(chunk_size, int) or chunk_size <= 0:
             raise ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}")
+        if filesystem_id is None:
+            filesystem_id = os.environ.get("VFS_PG_FILESYSTEM_ID", "default")
+        if not isinstance(filesystem_id, str) or not filesystem_id.strip():
+            raise ValueError("filesystem_id must be a non-empty string")
         self.dsn = dsn
         self._external_conn = conn
         self.chunk_size = chunk_size
+        self.filesystem_id = filesystem_id
         self.pool_min = pool_min
         self.pool_max = pool_max
         self._pool: AsyncConnectionPool | None = None
@@ -279,20 +327,26 @@ class PostgresStorageProvider(AsyncStorageProvider):
 
     async def _ensure_schema_locked(self, cur: Any) -> None:
         await cur.execute("SELECT pg_advisory_xact_lock(83710001)")
+        await cur.execute(SCHEMA_TABLES_SQL)
+        await cur.execute(INDEX_MIGRATION_SQL)
         # migration guard: never install the sibling unique index on dirty data
-        # (to_regclass -> NULL instead of an error on fresh databases, which
-        # would abort the surrounding transaction)
-        await cur.execute("SELECT to_regclass('vfs_nodes') IS NOT NULL")
-        if (await cur.fetchone())[0]:
-            await cur.execute(DUPLICATE_SIBLINGS_SQL)
-            dupes = await cur.fetchall()
-            if dupes:
-                detail = ", ".join(f"{p}/{n} (x{c})" for p, n, c in dupes)
-                raise RuntimeError(
-                    "duplicate sibling nodes detected; refusing to install the "
-                    f"unique index (deduplicate first): {detail}"
-                )
-        await cur.execute(SCHEMA_SQL)
+        await cur.execute(DUPLICATE_SIBLINGS_SQL)
+        dupes = await cur.fetchall()
+        if dupes:
+            detail = ", ".join(f"{fs}:{p}/{n} (x{c})" for fs, p, n, c in dupes)
+            raise RuntimeError(
+                "duplicate sibling nodes detected; refusing to install the "
+                f"unique index (deduplicate first): {detail}"
+            )
+        await cur.execute(SCHEMA_INDEXES_SQL)
+        await cur.execute(
+            """
+            INSERT INTO vfs_nodes (filesystem_id, parent_id, name, is_dir)
+            VALUES (%s, NULL, '', true)
+            ON CONFLICT (filesystem_id) WHERE parent_id IS NULL DO NOTHING
+            """,
+            (self.filesystem_id,),
+        )
 
     @staticmethod
     def _normalize(path: str) -> str:
@@ -330,8 +384,13 @@ class PostgresStorageProvider(AsyncStorageProvider):
     ) -> dict[str, Any] | None:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT * FROM vfs_nodes WHERE parent_id IS NOT DISTINCT FROM %s AND name = %s",
-                (parent_id, name),
+                """
+                SELECT * FROM vfs_nodes
+                 WHERE filesystem_id = %s
+                   AND parent_id IS NOT DISTINCT FROM %s
+                   AND name = %s
+                """,
+                (self.filesystem_id, parent_id, name),
             )
             return await cur.fetchone()
 
@@ -343,17 +402,23 @@ class PostgresStorageProvider(AsyncStorageProvider):
             await cur.execute(
                 """
                 SELECT *
-                  FROM vfs_nodes
-                 WHERE parent_id = %s AND name = %s
+                 FROM vfs_nodes
+                 WHERE filesystem_id = %s AND parent_id = %s AND name = %s
                    FOR UPDATE
                 """,
-                (parent_id, name),
+                (self.filesystem_id, parent_id, name),
             )
             return await cur.fetchone()
 
     async def _root_row(self, conn: AsyncConnection) -> dict[str, Any] | None:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("SELECT * FROM vfs_nodes WHERE parent_id IS NULL")
+            await cur.execute(
+                """
+                SELECT * FROM vfs_nodes
+                 WHERE filesystem_id = %s AND parent_id IS NULL
+                """,
+                (self.filesystem_id,),
+            )
             return await cur.fetchone()
 
     async def _resolve(self, conn: AsyncConnection, path: str) -> dict[str, Any] | None:
@@ -390,7 +455,11 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 return True
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT parent_id FROM vfs_nodes WHERE node_id = %s", (current,)
+                    """
+                    SELECT parent_id FROM vfs_nodes
+                     WHERE filesystem_id = %s AND node_id = %s
+                    """,
+                    (self.filesystem_id, current),
                 )
                 row = await cur.fetchone()
             current = row[0] if row else None
@@ -430,9 +499,50 @@ class PostgresStorageProvider(AsyncStorageProvider):
         """Fetch a node while holding its row lock until transaction end."""
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT * FROM vfs_nodes WHERE node_id = %s FOR UPDATE", (node_id,)
+                """
+                SELECT * FROM vfs_nodes
+                 WHERE filesystem_id = %s AND node_id = %s
+                   FOR UPDATE
+                """,
+                (self.filesystem_id, node_id),
             )
             return await cur.fetchone()
+
+    async def _lock_upload(
+        self, conn: AsyncConnection, upload_id: UUID
+    ) -> dict[str, Any] | None:
+        """Lock an upload only when its root belongs to this filesystem."""
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT u.*
+                  FROM vfs_uploads u
+                  JOIN vfs_nodes root ON root.node_id = u.root_id
+                 WHERE u.upload_id = %s
+                   AND root.filesystem_id = %s
+                   AND root.parent_id IS NULL
+                   FOR UPDATE OF u
+                """,
+                (upload_id, self.filesystem_id),
+            )
+            return await cur.fetchone()
+
+    async def _delete_upload(self, conn: AsyncConnection, upload_id: UUID) -> bool:
+        """Delete an upload only when its root belongs to this filesystem."""
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM vfs_uploads u
+                 USING vfs_nodes root
+                 WHERE u.upload_id = %s
+                   AND root.node_id = u.root_id
+                   AND root.filesystem_id = %s
+                   AND root.parent_id IS NULL
+                RETURNING u.upload_id
+                """,
+                (upload_id, self.filesystem_id),
+            )
+            return await cur.fetchone() is not None
 
     async def _insert_content_chunks(
         self, cur: Any, node_id: Any, content: bytes
@@ -470,16 +580,33 @@ class PostgresStorageProvider(AsyncStorageProvider):
         chunk_no = -1
         while True:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    f"""
-                    SELECT chunk_no, data
-                      FROM {table}
-                     WHERE {owner_column} = %s AND chunk_no > %s
-                     ORDER BY chunk_no
-                     LIMIT 1
-                    """,
-                    (owner_id, chunk_no),
-                )
+                if table == "vfs_chunks":
+                    await cur.execute(
+                        """
+                        SELECT c.chunk_no, c.data
+                          FROM vfs_chunks c
+                          JOIN vfs_nodes n ON n.node_id = c.node_id
+                         WHERE n.filesystem_id = %s
+                           AND c.node_id = %s AND c.chunk_no > %s
+                         ORDER BY c.chunk_no
+                         LIMIT 1
+                        """,
+                        (self.filesystem_id, owner_id, chunk_no),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT c.chunk_no, c.data
+                          FROM vfs_upload_chunks c
+                          JOIN vfs_uploads u ON u.upload_id = c.upload_id
+                          JOIN vfs_nodes root ON root.node_id = u.root_id
+                         WHERE root.filesystem_id = %s
+                           AND c.upload_id = %s AND c.chunk_no > %s
+                         ORDER BY c.chunk_no
+                         LIMIT 1
+                        """,
+                        (self.filesystem_id, owner_id, chunk_no),
+                    )
                 row = await cur.fetchone()
             if row is None:
                 return
@@ -553,8 +680,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
             output_no = existing_size // chunk_size
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT data FROM vfs_chunks WHERE node_id = %s AND chunk_no = %s",
-                    (node_id, output_no),
+                    """
+                    SELECT c.data
+                      FROM vfs_chunks c
+                      JOIN vfs_nodes n ON n.node_id = c.node_id
+                     WHERE n.filesystem_id = %s
+                       AND c.node_id = %s AND c.chunk_no = %s
+                    """,
+                    (self.filesystem_id, node_id, output_no),
                 )
                 row = await cur.fetchone()
             if row is None or len(row[0]) < partial:
@@ -616,13 +749,16 @@ class PostgresStorageProvider(AsyncStorageProvider):
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                        INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                        INSERT INTO vfs_nodes
+                            (filesystem_id, parent_id, name, is_dir, mime_type)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (filesystem_id, parent_id, name)
+                            WHERE parent_id IS NOT NULL
                         DO NOTHING
                         RETURNING node_id
                         """,
                     (
+                        self.filesystem_id,
                         parent_row["node_id"],
                         name,
                         node_info.is_dir,
@@ -647,14 +783,18 @@ class PostgresStorageProvider(AsyncStorageProvider):
             if row["is_dir"]:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT 1 FROM vfs_nodes WHERE parent_id = %s LIMIT 1",
-                        (row["node_id"],),
+                        """
+                        SELECT 1 FROM vfs_nodes
+                         WHERE filesystem_id = %s AND parent_id = %s LIMIT 1
+                        """,
+                        (self.filesystem_id, row["node_id"]),
                     )
                     if await cur.fetchone():
                         return False
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "DELETE FROM vfs_nodes WHERE node_id = %s", (row["node_id"],)
+                    "DELETE FROM vfs_nodes WHERE filesystem_id = %s AND node_id = %s",
+                    (self.filesystem_id, row["node_id"]),
                 )
             return True
 
@@ -678,8 +818,11 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 return []
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT name FROM vfs_nodes WHERE parent_id = %s ORDER BY name",
-                    (row["node_id"],),
+                    """
+                    SELECT name FROM vfs_nodes
+                     WHERE filesystem_id = %s AND parent_id = %s ORDER BY name
+                    """,
+                    (self.filesystem_id, row["node_id"]),
                 )
                 return [r[0] for r in await cur.fetchall()]
 
@@ -707,9 +850,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     """
                         UPDATE vfs_nodes
                            SET size = %s, sha256 = %s, chunk_size = %s, modified_at = now()
-                         WHERE node_id = %s
+                         WHERE filesystem_id = %s AND node_id = %s
                         """,
-                    (len(content), sha256, self.chunk_size, row["node_id"]),
+                    (
+                        len(content),
+                        sha256,
+                        self.chunk_size,
+                        self.filesystem_id,
+                        row["node_id"],
+                    ),
                 )
                 await cur.execute(
                     "DELETE FROM vfs_chunks WHERE node_id = %s",
@@ -755,13 +904,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
-                            INSERT INTO vfs_nodes (parent_id, name, is_dir)
-                            VALUES (%s, %s, false)
-                            ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                            INSERT INTO vfs_nodes
+                                (filesystem_id, parent_id, name, is_dir)
+                            VALUES (%s, %s, %s, false)
+                            ON CONFLICT (filesystem_id, parent_id, name)
+                                WHERE parent_id IS NOT NULL
                             DO NOTHING
                             RETURNING node_id
                             """,
-                        (parent_row["node_id"], name),
+                        (self.filesystem_id, parent_row["node_id"], name),
                     )
                     inserted = await cur.fetchone()
 
@@ -784,9 +935,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     """
                         UPDATE vfs_nodes
                            SET size = %s, sha256 = %s, chunk_size = %s, modified_at = now()
-                         WHERE node_id = %s
+                         WHERE filesystem_id = %s AND node_id = %s
                         """,
-                    (len(content), sha256, self.chunk_size, row["node_id"]),
+                    (
+                        len(content),
+                        sha256,
+                        self.chunk_size,
+                        self.filesystem_id,
+                        row["node_id"],
+                    ),
                 )
                 await cur.execute(
                     "DELETE FROM vfs_chunks WHERE node_id = %s",
@@ -849,8 +1006,16 @@ class PostgresStorageProvider(AsyncStorageProvider):
         async with self._acquire() as conn, self._tx(conn):
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    "SELECT * FROM vfs_uploads WHERE upload_id = %s FOR UPDATE",
-                    (upload_uuid,),
+                    """
+                    SELECT u.*
+                      FROM vfs_uploads u
+                      JOIN vfs_nodes root ON root.node_id = u.root_id
+                     WHERE u.upload_id = %s
+                       AND root.filesystem_id = %s
+                       AND root.parent_id IS NULL
+                       FOR UPDATE OF u
+                    """,
+                    (upload_uuid, self.filesystem_id),
                 )
                 upload = await cur.fetchone()
                 if upload is None:
@@ -901,8 +1066,16 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     offset = end
 
                 await cur.execute(
-                    "UPDATE vfs_uploads SET size = %s WHERE upload_id = %s",
-                    (original_size + len(view), upload_uuid),
+                    """
+                    UPDATE vfs_uploads u
+                       SET size = %s
+                      FROM vfs_nodes root
+                     WHERE u.upload_id = %s
+                       AND root.node_id = u.root_id
+                       AND root.filesystem_id = %s
+                       AND root.parent_id IS NULL
+                    """,
+                    (original_size + len(view), upload_uuid, self.filesystem_id),
                 )
             return True
 
@@ -944,21 +1117,12 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 sha256 = sha256.lower()
 
             async with self._acquire() as conn, self._tx(conn):
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        "SELECT * FROM vfs_uploads WHERE upload_id = %s FOR UPDATE",
-                        (upload_uuid,),
-                    )
-                    upload = await cur.fetchone()
+                upload = await self._lock_upload(conn, upload_uuid)
                 if upload is None:
                     return False
 
                 async def discard() -> None:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            "DELETE FROM vfs_uploads WHERE upload_id = %s",
-                            (upload_uuid,),
-                        )
+                    await self._delete_upload(conn, upload_uuid)
 
                 staged_size = int(upload["size"])
                 if size is not None and size != staged_size:
@@ -985,13 +1149,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     async with conn.cursor() as cur:
                         await cur.execute(
                             """
-                            INSERT INTO vfs_nodes (parent_id, name, is_dir)
-                            VALUES (%s, %s, false)
-                            ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                            INSERT INTO vfs_nodes
+                                (filesystem_id, parent_id, name, is_dir)
+                            VALUES (%s, %s, %s, false)
+                            ON CONFLICT (filesystem_id, parent_id, name)
+                                WHERE parent_id IS NOT NULL
                             DO NOTHING
                             RETURNING node_id
                             """,
-                            (parent_row["node_id"], name),
+                            (self.filesystem_id, parent_row["node_id"], name),
                         )
                         inserted = await cur.fetchone()
                     if inserted is not None:
@@ -1021,9 +1187,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
                             """
                             UPDATE vfs_nodes
                                SET size = %s, sha256 = %s, modified_at = now()
-                             WHERE node_id = %s
+                             WHERE filesystem_id = %s AND node_id = %s
                             """,
-                            (existing_size + staged_size, final_hash, node_id),
+                            (
+                                existing_size + staged_size,
+                                final_hash,
+                                self.filesystem_id,
+                                node_id,
+                            ),
                         )
                 else:
                     final_hash = sha256 or await self._staged_sha256(conn, upload_uuid)
@@ -1033,12 +1204,13 @@ class PostgresStorageProvider(AsyncStorageProvider):
                             UPDATE vfs_nodes
                                SET size = %s, sha256 = %s, chunk_size = %s,
                                    modified_at = now()
-                             WHERE node_id = %s
+                             WHERE filesystem_id = %s AND node_id = %s
                             """,
                             (
                                 staged_size,
                                 final_hash,
                                 upload["chunk_size"],
+                                self.filesystem_id,
                                 node_id,
                             ),
                         )
@@ -1071,12 +1243,8 @@ class PostgresStorageProvider(AsyncStorageProvider):
         """Immediately discard a staging upload and all of its chunks."""
         self._require_initialized()
         upload_uuid = self._coerce_upload_id(upload_id)
-        async with self._acquire() as conn, self._tx(conn), conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM vfs_uploads WHERE upload_id = %s RETURNING upload_id",
-                (upload_uuid,),
-            )
-            return await cur.fetchone() is not None
+        async with self._acquire() as conn, self._tx(conn):
+            return await self._delete_upload(conn, upload_uuid)
 
     async def read_file(self, path: str) -> bytes | None:
         """Read a file's complete content; None for missing paths/dirs."""
@@ -1092,10 +1260,10 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     SELECT n.is_dir, n.size, n.chunk_size, c.chunk_no, c.data
                       FROM vfs_nodes n
                       LEFT JOIN vfs_chunks c ON c.node_id = n.node_id
-                     WHERE n.node_id = %s
+                     WHERE n.filesystem_id = %s AND n.node_id = %s
                      ORDER BY c.chunk_no
                     """,
-                    (row["node_id"],),
+                    (self.filesystem_id, row["node_id"]),
                 )
                 parts = await cur.fetchall()
 
@@ -1137,7 +1305,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                                %s::bigint AS range_start,
                                LEAST(COALESCE(%s::bigint, size), size) AS range_end
                           FROM vfs_nodes
-                         WHERE node_id = %s
+                         WHERE filesystem_id = %s AND node_id = %s
                     )
                     SELECT target.is_dir,
                            target.size,
@@ -1155,7 +1323,13 @@ class PostgresStorageProvider(AsyncStorageProvider):
                            AND (target.range_end - 1) / target.chunk_size
                      ORDER BY c.chunk_no
                     """,
-                    (self.chunk_size, start, end, row["node_id"]),
+                    (
+                        self.chunk_size,
+                        start,
+                        end,
+                        self.filesystem_id,
+                        row["node_id"],
+                    ),
                 )
                 parts = await cur.fetchall()
 
@@ -1211,9 +1385,9 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     """
                         UPDATE vfs_nodes
                            SET metadata = metadata || %s::jsonb, modified_at = now()
-                         WHERE node_id = %s
+                         WHERE filesystem_id = %s AND node_id = %s
                         """,
-                    (Jsonb(metadata), row["node_id"]),
+                    (Jsonb(metadata), self.filesystem_id, row["node_id"]),
                 )
             return True
 
@@ -1239,7 +1413,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                    (MOVE_TOPOLOGY_LOCK_NAMESPACE,),
+                    (f"{MOVE_TOPOLOGY_LOCK_NAMESPACE}:{self.filesystem_id}",),
                 )
 
             # Resolve every path only after acquiring the topology lock. At
@@ -1269,9 +1443,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
                             """
                                 UPDATE vfs_nodes
                                    SET parent_id = %s, name = %s, modified_at = now()
-                                 WHERE node_id = %s
+                                 WHERE filesystem_id = %s AND node_id = %s
                                 """,
-                            (dest_parent["node_id"], dest_name, src_row["node_id"]),
+                            (
+                                dest_parent["node_id"],
+                                dest_name,
+                                self.filesystem_id,
+                                src_row["node_id"],
+                            ),
                         )
                 except psycopg.errors.UniqueViolation:
                     return False
@@ -1301,13 +1480,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     async with conn.cursor() as cur:
                         await cur.execute(
                             """
-                                INSERT INTO vfs_nodes (parent_id, name, is_dir, mime_type)
-                                VALUES (%s, %s, true, 'inode/directory')
-                                ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                                INSERT INTO vfs_nodes
+                                    (filesystem_id, parent_id, name, is_dir, mime_type)
+                                VALUES (%s, %s, %s, true, 'inode/directory')
+                                ON CONFLICT (filesystem_id, parent_id, name)
+                                    WHERE parent_id IS NOT NULL
                                 DO NOTHING
                                 RETURNING node_id
                                 """,
-                            (parent_row["node_id"], name),
+                            (self.filesystem_id, parent_row["node_id"], name),
                         )
                         inserted = await cur.fetchone()
                     if inserted is None:
@@ -1330,11 +1511,21 @@ class PostgresStorageProvider(AsyncStorageProvider):
                         COUNT(*) FILTER (WHERE NOT is_dir)   AS files,
                         COALESCE(SUM(size) FILTER (WHERE NOT is_dir), 0) AS total_bytes
                     FROM vfs_nodes
-                    """
+                    WHERE filesystem_id = %s
+                    """,
+                    (self.filesystem_id,),
                 )
                 row = await cur.fetchone()
                 assert row is not None  # aggregates always return a row
-                await cur.execute("SELECT COUNT(*) FROM vfs_chunks")
+                await cur.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM vfs_chunks c
+                      JOIN vfs_nodes n ON n.node_id = c.node_id
+                     WHERE n.filesystem_id = %s
+                    """,
+                    (self.filesystem_id,),
+                )
                 chunk_count = (await cur.fetchone())[0]
             return {
                 "total_size_bytes": row[2],
@@ -1355,13 +1546,17 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 await cur.execute(
                     """
                     WITH expired AS (
-                        DELETE FROM vfs_uploads
-                         WHERE created_at < now() - make_interval(secs => %s)
-                        RETURNING size
+                        DELETE FROM vfs_uploads u
+                         USING vfs_nodes root
+                         WHERE u.root_id = root.node_id
+                           AND root.filesystem_id = %s
+                           AND root.parent_id IS NULL
+                           AND u.created_at < now() - make_interval(secs => %s)
+                        RETURNING u.size
                     )
                     SELECT COUNT(*), COALESCE(SUM(size), 0) FROM expired
                     """,
-                    (UPLOAD_TTL_SECONDS,),
+                    (self.filesystem_id, UPLOAD_TTL_SECONDS),
                 )
                 row = await cur.fetchone()
             assert row is not None

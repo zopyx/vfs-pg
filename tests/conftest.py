@@ -11,6 +11,7 @@ existing server instead (the container is then skipped).
 from __future__ import annotations
 
 import os
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -21,6 +22,19 @@ import chuk_vfs_postgres  # noqa: F401  (registers the "postgres" provider)
 from chuk_vfs_postgres import PostgresStorageProvider
 
 IMAGE = os.environ.get("VFS_PG_IMAGE", "postgres:16-alpine")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def test_filesystem_id():
+    """Give this test session a private, non-destructive VFS namespace."""
+    previous = os.environ.get("VFS_PG_FILESYSTEM_ID")
+    filesystem_id = f"pytest-{uuid4()}"
+    os.environ["VFS_PG_FILESYSTEM_ID"] = filesystem_id
+    yield filesystem_id
+    if previous is None:
+        os.environ.pop("VFS_PG_FILESYSTEM_ID", None)
+    else:
+        os.environ["VFS_PG_FILESYSTEM_ID"] = previous
 
 
 @pytest.fixture(scope="session")
@@ -47,38 +61,48 @@ def dsn(postgres_container: PostgresContainer | None) -> str:
 
 
 @pytest_asyncio.fixture(scope="session")
-async def provider(dsn: str):
+async def provider(dsn: str, test_filesystem_id: str):
     """A PostgresStorageProvider on the test database (session-scoped)."""
     p = PostgresStorageProvider(dsn=dsn)
+    assert p.filesystem_id == test_filesystem_id
     assert await p.initialize(), "provider initialize failed"
     yield p
+    async with p._acquire() as conn, p._tx(conn), conn.cursor() as cur:
+        # Deleting only this session's root cascades its nodes, chunks, and
+        # root-owned staging uploads. Other namespaces remain untouched.
+        await cur.execute(
+            """
+            DELETE FROM vfs_nodes
+             WHERE filesystem_id = %s AND parent_id IS NULL
+            """,
+            (test_filesystem_id,),
+        )
     await p.close()
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def clean_db(provider, dsn: str):
-    """Reset the VFS tree before every test (keeps the root node).
-
-    Safety: when running against an externally provided database
-    (``VFS_PG_DSN``), truncation is refused unless the database name contains
-    ``test`` or ``VFS_PG_ALLOW_TRUNCATE=1`` is set explicitly — the suite
-    must never destroy data in an arbitrary database.
-    """
-    from psycopg.conninfo import conninfo_to_dict
-
-    env_dsn = os.environ.get("VFS_PG_DSN")
-    if env_dsn:
-        dbname = str(conninfo_to_dict(env_dsn).get("dbname") or "")
-        if "test" not in dbname and os.environ.get("VFS_PG_ALLOW_TRUNCATE") != "1":
-            pytest.fail(
-                "refusing to TRUNCATE a non-test database "
-                f"(dbname={dbname!r}). Point VFS_PG_DSN at a database whose "
-                "name contains 'test' or set VFS_PG_ALLOW_TRUNCATE=1."
-            )
-    async with provider._acquire() as conn, conn.cursor() as cur:
-        await cur.execute("TRUNCATE vfs_nodes CASCADE")
+async def clean_db(provider):
+    """Clear only this session's root children and staging uploads."""
+    async with provider._acquire() as conn, provider._tx(conn), conn.cursor() as cur:
         await cur.execute(
-            "INSERT INTO vfs_nodes (parent_id, name, is_dir) VALUES (NULL, '', true)"
+            """
+            DELETE FROM vfs_uploads u
+             USING vfs_nodes root
+             WHERE root.node_id = u.root_id
+               AND root.filesystem_id = %s
+               AND root.parent_id IS NULL
+            """,
+            (provider.filesystem_id,),
+        )
+        await cur.execute(
+            """
+            DELETE FROM vfs_nodes child
+             USING vfs_nodes root
+             WHERE child.parent_id = root.node_id
+               AND root.filesystem_id = %s
+               AND root.parent_id IS NULL
+            """,
+            (provider.filesystem_id,),
         )
     yield
 
