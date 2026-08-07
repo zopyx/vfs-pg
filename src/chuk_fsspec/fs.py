@@ -18,6 +18,8 @@ Sync users get the plain fsspec API; internals are async (psycopg pool).
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import posixpath
 from typing import Any
@@ -34,9 +36,9 @@ DEFAULT_BLOCK_SIZE = 5 * 1024 * 1024  # 5 MiB
 class ChukBufferedFile(AbstractBufferedFile):
     """Buffered file object backed by the chuk VFS.
 
-    Writes are buffered in memory and flushed to the VFS on close
-    (``_upload_chunk(final=True)``); reads use ``_fetch_range`` which maps
-    to chunk-aware range reads on the provider.
+    Providers exposing the staging-upload extension receive each fsspec block
+    immediately; only generic providers retain blocks until close. Reads use
+    ``_fetch_range`` which maps to chunk-aware range reads on the provider.
     """
 
     DEFAULT_BLOCK_SIZE = DEFAULT_BLOCK_SIZE
@@ -51,35 +53,104 @@ class ChukBufferedFile(AbstractBufferedFile):
         details: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(fs, path, mode=mode, block_size=block_size, size=size, **kwargs)
+        super().__init__(
+            fs, path, mode=mode, block_size=block_size, size=size, **kwargs
+        )
         if details is not None:
             self.details = details
-        self._parts: list[bytes] = []
         self._append = "a" in mode
+        provider, _local = fs.vfs._get_provider_for_path(path)
+        self._streaming_upload = all(
+            callable(getattr(provider, method, None))
+            for method in (
+                "start_upload",
+                "upload_part",
+                "finish_upload",
+                "abort_upload",
+            )
+        )
+        self._upload_id: Any | None = None
+        self._upload_size = 0
+        self._upload_sha256 = None if self._append else hashlib.sha256()
+        if not self._streaming_upload:
+            self._parts: list[bytes] = []
 
     def _initiate_upload(self) -> None:
-        # content is written atomically on final close
-        pass
+        if not self._streaming_upload:
+            return
+        self._upload_id = self.fs.start_upload(
+            self.path, exclusive="x" in self.mode, append=self._append
+        )
+        if self._upload_id is None:
+            raise OSError(f"could not start upload: {self.path}")
 
     def _upload_chunk(self, final: bool = False) -> None:
-        self._parts.append(self.buffer.getvalue())
-        if final:
-            content = b"".join(self._parts)
-            self._parts = []
-            if self._append:
-                existing = (
-                    self.fs.cat_file(self.path)
-                    if self.fs.exists(self.path)
-                    else b""
-                )
-                content = existing + content
-            ok = self.fs.commit(self.path, content, exclusive="x" in self.mode)
-            if not ok:
-                # commit-time exclusivity enforcement: the file appeared after
-                # _open() ran (or a concurrent exclusive create won)
-                if "x" in self.mode:
-                    raise FileExistsError(self.path)
-                raise OSError(f"write failed: {self.path}")
+        # AbstractBufferedFile normally calls _initiate_upload first. Keeping
+        # this guard also preserves the direct/internal generic call pattern.
+        if self._streaming_upload and self._upload_id is not None:
+            data = self.buffer.getbuffer()
+            try:
+                if data:
+                    ok = self.fs.upload_part(self.path, self._upload_id, data)
+                    if not ok:
+                        raise OSError(f"upload part failed: {self.path}")
+                    if self._upload_sha256 is not None:
+                        self._upload_sha256.update(data)
+                    self._upload_size += len(data)
+                if final:
+                    digest = (
+                        self._upload_sha256.hexdigest()
+                        if self._upload_sha256 is not None
+                        else None
+                    )
+                    ok = self.fs.finish_upload(
+                        self.path,
+                        self._upload_id,
+                        size=self._upload_size,
+                        sha256=digest,
+                    )
+                    if not ok:
+                        if "x" in self.mode:
+                            raise FileExistsError(self.path)
+                        raise OSError(f"write failed: {self.path}")
+                    self._upload_id = None
+                return
+            except Exception:
+                upload_id, self._upload_id = self._upload_id, None
+                with contextlib.suppress(Exception):
+                    self.fs.abort_upload(self.path, upload_id)
+                self.closed = True
+                raise
+
+        parts = getattr(self, "_parts", None)
+        if parts is None:
+            parts = self._parts = []
+        parts.append(self.buffer.getvalue())
+        if not final:
+            return
+        content = b"".join(parts)
+        self._parts = []
+        if self._append:
+            existing = self.fs.cat_file(self.path) if self.fs.exists(self.path) else b""
+            content = existing + content
+        ok = self.fs.commit(self.path, content, exclusive="x" in self.mode)
+        if not ok:
+            # commit-time exclusivity enforcement: the file appeared after
+            # _open() ran (or a concurrent exclusive create won)
+            if "x" in self.mode:
+                raise FileExistsError(self.path)
+            raise OSError(f"write failed: {self.path}")
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Discard an in-flight staged upload when the with-block fails."""
+        if exc_type is not None and self.mode != "rb" and self._streaming_upload:
+            upload_id, self._upload_id = self._upload_id, None
+            if upload_id is not None:
+                with contextlib.suppress(Exception):
+                    self.fs.abort_upload(self.path, upload_id)
+            self.closed = True
+            return None
+        return super().__exit__(exc_type, exc_value, traceback)
 
     # reads: default AbstractBufferedFile._fetch_range calls
     # self.fs.cat_file(path, start=start, end=end) -> our async _cat_file
@@ -339,6 +410,73 @@ class ChukFileSystem(AsyncFileSystem):
         if not ok:
             raise OSError(f"write failed: {path}")
 
+    async def _ensure_parent_directories(self, path: str) -> None:
+        """Create the target's missing parent chain using VFS mount semantics."""
+        parent = posixpath.dirname(path) or "/"
+        if parent == "/":
+            return
+        current = ""
+        for part in (part for part in parent.split("/") if part):
+            current = f"{current}/{part}"
+            if await self.vfs.exists(current):
+                if not await self.vfs.is_dir(current):
+                    raise FileExistsError(f"not a directory: {current}")
+                continue
+            created = await self.vfs.mkdir(current)
+            # Recursive fsspec copies may schedule the directory entry and a
+            # child concurrently. A false create is success when the other
+            # task won the same-directory race.
+            if not created and not (
+                await self.vfs.exists(current) and await self.vfs.is_dir(current)
+            ):
+                raise OSError(f"could not create parent directory: {current}")
+
+    async def _start_upload(
+        self, path: str, *, exclusive: bool = False, append: bool = False
+    ) -> Any:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
+        await self._ensure_parent_directories(path)
+        provider, local = self.vfs._get_provider_for_path(path)
+        starter = getattr(provider, "start_upload", None)
+        if not callable(starter):
+            return None
+        return await starter(local, exclusive=exclusive, append=append)
+
+    async def _upload_part(self, path: str, upload_id: Any, content: bytes) -> bool:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
+        provider, _local = self.vfs._get_provider_for_path(path)
+        uploader = getattr(provider, "upload_part", None)
+        if not callable(uploader):
+            return False
+        return bool(await uploader(upload_id, content))
+
+    async def _finish_upload(
+        self,
+        path: str,
+        upload_id: Any,
+        *,
+        size: int,
+        sha256: str | None,
+    ) -> bool:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
+        provider, _local = self.vfs._get_provider_for_path(path)
+        finisher = getattr(provider, "finish_upload", None)
+        if not callable(finisher):
+            return False
+        return bool(await finisher(upload_id, size=size, sha256=sha256))
+
+    async def _abort_upload(self, path: str, upload_id: Any) -> bool:
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
+        provider, _local = self.vfs._get_provider_for_path(path)
+        aborter = getattr(provider, "abort_upload", None)
+        if not callable(aborter):
+            return False
+        return bool(await aborter(upload_id))
+
     async def _commit(self, path: str, content: bytes, *, exclusive: bool) -> bool:
         """Write content, preferring the provider's atomic create-or-replace.
 
@@ -349,14 +487,7 @@ class ChukFileSystem(AsyncFileSystem):
         """
         path = self._strip_protocol(path)
         assert isinstance(path, str)
-        parent = posixpath.dirname(path) or "/"
-        if parent != "/":
-            parts = [p for p in parent.split("/") if p]
-            current = ""
-            for part in parts:
-                current = f"{current}/{part}"
-                if not await self.vfs.exists(current):
-                    await self.vfs.mkdir(current)
+        await self._ensure_parent_directories(path)
         provider, local = self.vfs._get_provider_for_path(path)
         atomic = getattr(provider, "write_file_atomic", None)
         if atomic is not None:
@@ -369,6 +500,10 @@ class ChukFileSystem(AsyncFileSystem):
     # sync entry point for ChukBufferedFile._upload_chunk (sync context);
     # fsspec only auto-generates sync wrappers for its known async_methods
     commit = sync_wrapper(_commit)
+    start_upload = sync_wrapper(_start_upload)
+    upload_part = sync_wrapper(_upload_part)
+    finish_upload = sync_wrapper(_finish_upload)
+    abort_upload = sync_wrapper(_abort_upload)
 
     async def _open(
         self,

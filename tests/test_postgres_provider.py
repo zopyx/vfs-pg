@@ -764,6 +764,130 @@ async def test_write_file_atomic_overwrite(provider):
 
 
 # ----------------------------------------------------------------------
+# staged streaming uploads
+# ----------------------------------------------------------------------
+
+
+async def test_staged_upload_parts_cross_chunk_boundaries(dsn):
+    p = PostgresStorageProvider(dsn=dsn, chunk_size=4)
+    assert await p.initialize()
+    try:
+        await _mkfile(p, "/staged.bin")
+        assert await p.write_file("/staged.bin", b"old")
+
+        upload_id = await p.start_upload("/staged.bin")
+        assert await p.upload_part(upload_id, b"abc")
+        assert await p.upload_part(upload_id, b"defgh")
+
+        # Parts are durable but the old target remains the only visible data.
+        assert await p.read_file("/staged.bin") == b"old"
+        async with p._acquire() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT chunk_no, data FROM vfs_upload_chunks
+                 WHERE upload_id = %s ORDER BY chunk_no
+                """,
+                (upload_id,),
+            )
+            assert await cur.fetchall() == [(0, b"abcd"), (1, b"efgh")]
+
+        content = b"abcdefgh"
+        assert await p.finish_upload(
+            upload_id, len(content), hashlib.sha256(content).hexdigest()
+        )
+        assert await p.read_file("/staged.bin") == content
+        async with p._acquire() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            assert await cur.fetchone() == (0,)
+            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            assert await cur.fetchone() == (0,)
+    finally:
+        await p.close()
+
+
+async def test_abort_and_failed_finish_leave_target_unchanged(provider):
+    await _mkfile(provider, "/keep.bin")
+    assert await provider.write_file("/keep.bin", b"old")
+
+    aborted = await provider.start_upload("/new.bin")
+    assert await provider.upload_part(aborted, b"never visible")
+    assert not await provider.exists("/new.bin")
+    assert await provider.abort_upload(aborted)
+
+    failed = await provider.start_upload("/keep.bin")
+    assert await provider.upload_part(failed, b"new")
+    assert not await provider.finish_upload(failed, size=99)
+    assert await provider.read_file("/keep.bin") == b"old"
+
+    async with provider._acquire() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+        assert await cur.fetchone() == (0,)
+
+
+async def test_empty_staged_upload_creates_empty_file(provider):
+    upload_id = await provider.start_upload("/empty-staged.bin")
+    assert await provider.finish_upload(
+        upload_id, size=0, sha256=hashlib.sha256(b"").hexdigest()
+    )
+    assert await provider.read_file("/empty-staged.bin") == b""
+
+
+async def test_append_rechunks_across_different_provider_chunk_sizes(dsn):
+    writer = PostgresStorageProvider(dsn=dsn, chunk_size=4)
+    appender = PostgresStorageProvider(dsn=dsn, chunk_size=7)
+    assert await writer.initialize()
+    assert await appender.initialize()
+    try:
+        assert await writer.write_file_atomic("/mixed-append.bin", b"abcdef")
+        suffix = b"ghijklmnop"
+        upload_id = await appender.start_upload("/mixed-append.bin", append=True)
+        assert await appender.upload_part(upload_id, suffix[:3])
+        assert await appender.upload_part(upload_id, suffix[3:])
+        assert await appender.finish_upload(upload_id, size=len(suffix))
+        expected = b"abcdef" + suffix
+        assert await writer.read_file("/mixed-append.bin") == expected
+        node = await writer.get_node_info("/mixed-append.bin")
+        assert node is not None
+        assert node.sha256 == hashlib.sha256(expected).hexdigest()
+
+        missing = await appender.start_upload("/new-append.bin", append=True)
+        assert await appender.upload_part(missing, b"created by append")
+        assert await appender.finish_upload(missing, size=len(b"created by append"))
+        assert await appender.read_file("/new-append.bin") == b"created by append"
+    finally:
+        await writer.close()
+        await appender.close()
+
+
+async def test_failed_upload_part_aborts_session(provider):
+    upload_id = await provider.start_upload("/invalid-part.bin")
+    with pytest.raises(TypeError, match="bytes-like"):
+        await provider.upload_part(upload_id, "not bytes")  # type: ignore[arg-type]
+    assert not await provider.exists("/invalid-part.bin")
+    assert not await provider.abort_upload(upload_id)
+
+
+async def test_cleanup_removes_only_stale_staging_uploads(provider):
+    stale = await provider.start_upload("/stale.bin")
+    fresh = await provider.start_upload("/fresh.bin")
+    assert await provider.upload_part(stale, b"stale bytes")
+    assert await provider.upload_part(fresh, b"fresh")
+    async with provider._acquire() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE vfs_uploads SET created_at = now() - interval '25 hours' WHERE upload_id = %s",
+            (stale,),
+        )
+
+    assert await provider.cleanup() == {
+        "files_removed": 0,
+        "bytes_freed": len(b"stale bytes"),
+        "expired_removed": 1,
+    }
+    assert not await provider.abort_upload(stale)
+    assert await provider.abort_upload(fresh)
+
+
+# ----------------------------------------------------------------------
 # default DSN / external_connection property
 # ----------------------------------------------------------------------
 

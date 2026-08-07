@@ -204,6 +204,92 @@ async def test_concurrent_exclusive_writes_single_winner(dsn):
         await provider.close()
 
 
+async def test_concurrent_staged_appends_all_survive_once(dsn):
+    provider = PostgresStorageProvider(dsn=dsn, chunk_size=7, pool_min=4, pool_max=8)
+    assert await provider.initialize()
+    try:
+        assert await provider.write_file_atomic("/append.log", b"start|")
+        suffixes = [f"part-{i:02d}|".encode() for i in range(12)]
+
+        async def _append(suffix: bytes) -> bool:
+            upload_id = await provider.start_upload("/append.log", append=True)
+            # Split every suffix differently to exercise partial staged chunks.
+            split = max(1, len(suffix) // 2)
+            assert await provider.upload_part(upload_id, suffix[:split])
+            assert await provider.upload_part(upload_id, suffix[split:])
+            return await provider.finish_upload(upload_id, size=len(suffix))
+
+        assert all(await asyncio.gather(*(_append(suffix) for suffix in suffixes)))
+        result = await provider.read_file("/append.log")
+        assert result is not None and result.startswith(b"start|")
+        for suffix in suffixes:
+            assert result.count(suffix) == 1
+        assert len(result) == len(b"start|") + sum(map(len, suffixes))
+        node = await provider.get_node_info("/append.log")
+        assert node is not None
+        assert node.sha256 == hashlib.sha256(result).hexdigest()
+    finally:
+        await provider.close()
+
+
+async def test_concurrent_staged_exclusive_losers_are_cleaned(dsn):
+    provider = PostgresStorageProvider(dsn=dsn, pool_min=4, pool_max=8)
+    assert await provider.initialize()
+    try:
+        contents = [f"exclusive-{i}".encode() for i in range(8)]
+
+        async def _exclusive(content: bytes) -> bool:
+            upload_id = await provider.start_upload("/staged-race.bin", exclusive=True)
+            assert await provider.upload_part(upload_id, content)
+            return await provider.finish_upload(
+                upload_id, len(content), hashlib.sha256(content).hexdigest()
+            )
+
+        results = await asyncio.gather(*(_exclusive(content) for content in contents))
+        assert results.count(True) == 1
+        assert await provider.read_file("/staged-race.bin") in contents
+        async with provider._acquire() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            assert await cur.fetchone() == (0,)
+            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            assert await cur.fetchone() == (0,)
+    finally:
+        await provider.close()
+
+
+async def test_staged_overwrite_readers_see_only_old_or_new(dsn):
+    provider = PostgresStorageProvider(dsn=dsn, chunk_size=64 * 1024)
+    assert await provider.initialize()
+    try:
+        old = b"o" * (3 * 64 * 1024 + 13)
+        new = b"n" * (4 * 64 * 1024 + 29)
+        assert await provider.write_file_atomic("/atomic-stage.bin", old)
+        upload_id = await provider.start_upload("/atomic-stage.bin")
+        for offset in range(0, len(new), 31 * 1024):
+            assert await provider.upload_part(
+                upload_id, new[offset : offset + 31 * 1024]
+            )
+            assert await provider.read_file("/atomic-stage.bin") == old
+
+        allowed = {hashlib.sha256(old).hexdigest(), hashlib.sha256(new).hexdigest()}
+
+        async def _finish() -> None:
+            assert await provider.finish_upload(
+                upload_id, len(new), hashlib.sha256(new).hexdigest()
+            )
+
+        async def _read() -> None:
+            for _ in range(30):
+                data = await provider.read_file("/atomic-stage.bin")
+                assert data is not None
+                assert hashlib.sha256(data).hexdigest() in allowed
+
+        await asyncio.gather(_finish(), *(_read() for _ in range(3)))
+        assert await provider.read_file("/atomic-stage.bin") == new
+    finally:
+        await provider.close()
+
+
 async def test_concurrent_nonexclusive_first_writes_both_succeed(dsn, monkeypatch):
     """A missing-file insert race remains create-or-replace for both writers."""
     provider = PostgresStorageProvider(dsn=dsn, pool_min=2, pool_max=2)

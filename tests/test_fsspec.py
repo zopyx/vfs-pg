@@ -251,6 +251,49 @@ def test_open_multiblock_write(fs):
     assert fs.cat_file("/large.bin") == content
 
 
+def test_open_multiblock_uses_staging_without_retaining_parts(fs):
+    content = random.Random(70).randbytes(BLOCK + CHUNK + 17)
+    provider, _local = fs.vfs._get_provider_for_path("/streamed.bin")
+
+    async def _staging_counts():
+        async with provider._acquire() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            uploads = (await cur.fetchone())[0]
+            await cur.execute("SELECT COUNT(*) FROM vfs_upload_chunks")
+            chunks = (await cur.fetchone())[0]
+        return uploads, chunks
+
+    with fs.open("/streamed.bin", "wb") as f:
+        f.write(content)
+        assert not hasattr(f, "_parts") or f._parts == []
+        assert not fs.exists("/streamed.bin")
+        uploads, chunks = _run_async(fs, _staging_counts())
+        assert uploads == 1
+        assert chunks >= 2
+
+    assert fs.cat_file("/streamed.bin") == content
+    assert _run_async(fs, _staging_counts()) == (0, 0)
+
+
+def test_staged_upload_aborts_when_with_block_raises(fs):
+    with (
+        pytest.raises(RuntimeError, match="application failure"),
+        fs.open("/aborted.bin", "wb") as f,
+    ):
+        f.write(b"x" * (BLOCK + 1))
+        raise RuntimeError("application failure")
+
+    assert not fs.exists("/aborted.bin")
+    provider, _local = fs.vfs._get_provider_for_path("/aborted.bin")
+
+    async def _upload_count():
+        async with provider._acquire() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM vfs_uploads")
+            return (await cur.fetchone())[0]
+
+    assert _run_async(fs, _upload_count()) == 0
+
+
 def test_open_append(fs):
     fs.pipe_file("/log.txt", b"line1\n")
     with fs.open("/log.txt", "ab") as f:

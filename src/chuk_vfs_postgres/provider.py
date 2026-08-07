@@ -30,6 +30,7 @@ import hashlib
 import posixpath
 from collections.abc import AsyncIterator
 from typing import Any
+from uuid import UUID
 
 import psycopg
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
@@ -41,6 +42,7 @@ from psycopg_pool import AsyncConnectionPool
 
 DEFAULT_DSN = "postgresql://vfs:vfs@localhost:5432/vfs"
 DEFAULT_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+UPLOAD_TTL_SECONDS = 24 * 60 * 60  # abandoned staging uploads live for at most one day
 MOVE_TOPOLOGY_LOCK_NAMESPACE = "chuk_vfs_postgres:vfs_nodes:move"
 
 SCHEMA_SQL = """
@@ -77,6 +79,28 @@ CREATE TABLE IF NOT EXISTS vfs_chunks (
     chunk_no  integer NOT NULL,
     data      bytea NOT NULL,
     PRIMARY KEY (node_id, chunk_no)
+);
+
+CREATE TABLE IF NOT EXISTS vfs_uploads (
+    upload_id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    root_id      uuid NOT NULL REFERENCES vfs_nodes(node_id) ON DELETE CASCADE,
+    target_path  text NOT NULL,
+    exclusive    boolean NOT NULL DEFAULT false,
+    append       boolean NOT NULL DEFAULT false,
+    chunk_size   integer NOT NULL CHECK (chunk_size > 0),
+    size         bigint NOT NULL DEFAULT 0,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vfs_uploads_created_at
+    ON vfs_uploads (created_at);
+
+CREATE TABLE IF NOT EXISTS vfs_upload_chunks (
+    upload_id   uuid NOT NULL REFERENCES vfs_uploads(upload_id) ON DELETE CASCADE,
+    chunk_no    integer NOT NULL,
+    data        bytea NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (upload_id, chunk_no)
 );
 
 INSERT INTO vfs_nodes (parent_id, name, is_dir)
@@ -391,6 +415,186 @@ class PostgresStorageProvider(AsyncStorageProvider):
             permissions="755" if row["is_dir"] else "644",
         )
 
+    @staticmethod
+    def _coerce_upload_id(upload_id: UUID | str) -> UUID:
+        """Validate upload ids before sending them to PostgreSQL."""
+        if isinstance(upload_id, UUID):
+            return upload_id
+        if not isinstance(upload_id, str):
+            raise TypeError("upload_id must be a UUID or UUID string")
+        return UUID(upload_id)
+
+    async def _lock_node(
+        self, conn: AsyncConnection, node_id: Any
+    ) -> dict[str, Any] | None:
+        """Fetch a node while holding its row lock until transaction end."""
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM vfs_nodes WHERE node_id = %s FOR UPDATE", (node_id,)
+            )
+            return await cur.fetchone()
+
+    async def _insert_content_chunks(
+        self, cur: Any, node_id: Any, content: bytes
+    ) -> None:
+        """Insert content without constructing a second full chunk/row list."""
+        view = memoryview(content)
+        rows = (
+            (node_id, chunk_no, view[offset : offset + self.chunk_size])
+            for chunk_no, offset in enumerate(range(0, len(view), self.chunk_size))
+        )
+        await cur.executemany(
+            "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
+            rows,
+        )
+
+    async def _iter_chunk_data(
+        self,
+        conn: AsyncConnection,
+        table: str,
+        owner_column: str,
+        owner_id: Any,
+    ) -> AsyncIterator[bytes]:
+        """Yield ordered chunks one row at a time with bounded client memory.
+
+        The table and owner column are selected only by internal callers. A
+        one-row keyset query avoids psycopg materializing an entire result set
+        and also works for transaction-joined/autocommit connections where a
+        named server-side cursor may not be available.
+        """
+        if (table, owner_column) not in {
+            ("vfs_chunks", "node_id"),
+            ("vfs_upload_chunks", "upload_id"),
+        }:
+            raise ValueError("unsupported chunk source")
+        chunk_no = -1
+        while True:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"""
+                    SELECT chunk_no, data
+                      FROM {table}
+                     WHERE {owner_column} = %s AND chunk_no > %s
+                     ORDER BY chunk_no
+                     LIMIT 1
+                    """,
+                    (owner_id, chunk_no),
+                )
+                row = await cur.fetchone()
+            if row is None:
+                return
+            chunk_no = row[0]
+            yield bytes(row[1])
+
+    async def _staged_sha256(self, conn: AsyncConnection, upload_id: UUID) -> str:
+        digest = hashlib.sha256()
+        async for chunk in self._iter_chunk_data(
+            conn, "vfs_upload_chunks", "upload_id", upload_id
+        ):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _append_sha256(
+        self,
+        conn: AsyncConnection,
+        node_id: Any,
+        existing_size: int,
+        upload_id: UUID,
+        staged_size: int,
+    ) -> str:
+        """Hash existing and appended bytes without assembling the file."""
+        digest = hashlib.sha256()
+        remaining = existing_size
+        async for chunk in self._iter_chunk_data(
+            conn, "vfs_chunks", "node_id", node_id
+        ):
+            if remaining <= 0:
+                break
+            logical = chunk[:remaining]
+            digest.update(logical)
+            remaining -= len(logical)
+        if remaining:
+            raise RuntimeError("existing file chunks are shorter than node size")
+
+        remaining = staged_size
+        async for chunk in self._iter_chunk_data(
+            conn, "vfs_upload_chunks", "upload_id", upload_id
+        ):
+            if remaining <= 0:
+                break
+            logical = chunk[:remaining]
+            digest.update(logical)
+            remaining -= len(logical)
+        if remaining:
+            raise RuntimeError("staged chunks are shorter than upload size")
+        return digest.hexdigest()
+
+    async def _append_staged_chunks(
+        self,
+        conn: AsyncConnection,
+        node: dict[str, Any],
+        upload: dict[str, Any],
+    ) -> None:
+        """Append staged bytes while retaining at most two chunks in memory."""
+        staged_size = int(upload["size"])
+        if staged_size == 0:
+            return
+
+        node_id = node["node_id"]
+        existing_size = int(node["size"])
+        chunk_size = int(node["chunk_size"] or self.chunk_size)
+        upload_id = upload["upload_id"]
+        partial = existing_size % chunk_size
+        output_no = existing_size // chunk_size
+        replace_existing = False
+        pending = bytearray()
+
+        if partial:
+            output_no = existing_size // chunk_size
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT data FROM vfs_chunks WHERE node_id = %s AND chunk_no = %s",
+                    (node_id, output_no),
+                )
+                row = await cur.fetchone()
+            if row is None or len(row[0]) < partial:
+                raise RuntimeError("existing file is missing its final chunk")
+            pending.extend(bytes(row[0])[:partial])
+            replace_existing = True
+
+        async def write_output(data: bytes) -> None:
+            nonlocal output_no, replace_existing
+            async with conn.cursor() as cur:
+                if replace_existing:
+                    await cur.execute(
+                        """
+                        UPDATE vfs_chunks SET data = %s
+                         WHERE node_id = %s AND chunk_no = %s
+                        """,
+                        (data, node_id, output_no),
+                    )
+                    replace_existing = False
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO vfs_chunks (node_id, chunk_no, data)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (node_id, output_no, data),
+                    )
+            output_no += 1
+
+        async for chunk in self._iter_chunk_data(
+            conn, "vfs_upload_chunks", "upload_id", upload_id
+        ):
+            pending.extend(chunk)
+            while len(pending) >= chunk_size:
+                await write_output(bytes(pending[:chunk_size]))
+                del pending[:chunk_size]
+
+        if pending:
+            await write_output(bytes(pending))
+
     # ------------------------------------------------------------------
     # chuk provider API
     # ------------------------------------------------------------------
@@ -493,10 +697,6 @@ class PostgresStorageProvider(AsyncStorageProvider):
             content = content.encode("utf-8")
 
         sha256 = hashlib.sha256(content).hexdigest()
-        chunks = [
-            content[i : i + self.chunk_size]
-            for i in range(0, len(content), self.chunk_size)
-        ]
 
         async with self._acquire() as conn, self._tx(conn):
             row = await self._resolve(conn, path)
@@ -515,13 +715,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     "DELETE FROM vfs_chunks WHERE node_id = %s",
                     (row["node_id"],),
                 )
-                await cur.executemany(
-                    "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
-                    [
-                        (row["node_id"], i, chunk)
-                        for i, chunk in enumerate(chunks)
-                    ],
-                )
+                await self._insert_content_chunks(cur, row["node_id"], content)
             return True
 
     async def write_file_atomic(
@@ -546,10 +740,6 @@ class PostgresStorageProvider(AsyncStorageProvider):
             content = content.encode("utf-8")
 
         sha256 = hashlib.sha256(content).hexdigest()
-        chunks = [
-            content[i : i + self.chunk_size]
-            for i in range(0, len(content), self.chunk_size)
-        ]
 
         async with self._acquire() as conn, self._tx(conn):
             row = await self._resolve(conn, path)
@@ -602,14 +792,291 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     "DELETE FROM vfs_chunks WHERE node_id = %s",
                     (row["node_id"],),
                 )
-                await cur.executemany(
-                    "INSERT INTO vfs_chunks (node_id, chunk_no, data) VALUES (%s, %s, %s)",
-                    [
-                        (row["node_id"], i, chunk)
-                        for i, chunk in enumerate(chunks)
-                    ],
+                await self._insert_content_chunks(cur, row["node_id"], content)
+            return True
+
+    async def start_upload(
+        self, path: str, exclusive: bool = False, append: bool = False
+    ) -> UUID:
+        """Create an invisible, durable staging upload.
+
+        Starting and adding parts never creates or modifies the target node.
+        The target is only resolved and changed by :meth:`finish_upload`.
+        Staging rows abandoned for more than :data:`UPLOAD_TTL_SECONDS` are
+        removed by :meth:`cleanup`.
+        """
+        self._require_initialized()
+        path = self._normalize(path)
+        if path == "/":
+            raise ValueError("cannot upload file content to the root directory")
+        if exclusive and append:
+            raise ValueError("exclusive and append uploads are mutually exclusive")
+
+        async with self._acquire() as conn, self._tx(conn):
+            root = await self._root_row(conn)
+            if root is None:
+                raise RuntimeError("VFS root node is missing")
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO vfs_uploads
+                        (root_id, target_path, exclusive, append, chunk_size)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING upload_id
+                    """,
+                    (root["node_id"], path, exclusive, append, self.chunk_size),
+                )
+                row = await cur.fetchone()
+            assert row is not None
+            return row[0]
+
+    async def upload_part(self, upload_id: UUID | str, content: bytes) -> bool:
+        """Persist one upload block, carrying partial provider chunks forward."""
+        self._require_initialized()
+        upload_uuid = self._coerce_upload_id(upload_id)
+        try:
+            return await self._stage_upload_part(upload_uuid, content)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self.abort_upload(upload_uuid)
+            raise
+
+    async def _stage_upload_part(self, upload_uuid: UUID, content: bytes) -> bool:
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise TypeError("upload content must be bytes-like")
+        view = memoryview(content)
+
+        async with self._acquire() as conn, self._tx(conn):
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT * FROM vfs_uploads WHERE upload_id = %s FOR UPDATE",
+                    (upload_uuid,),
+                )
+                upload = await cur.fetchone()
+                if upload is None:
+                    return False
+                if not view:
+                    return True
+
+                chunk_size = int(upload["chunk_size"])
+                original_size = int(upload["size"])
+                chunk_no = original_size // chunk_size
+                offset = 0
+                partial = original_size % chunk_size
+
+                if partial:
+                    await cur.execute(
+                        """
+                        SELECT data FROM vfs_upload_chunks
+                         WHERE upload_id = %s AND chunk_no = %s
+                        """,
+                        (upload_uuid, chunk_no),
+                    )
+                    tail = await cur.fetchone()
+                    if tail is None or len(tail["data"]) != partial:
+                        raise RuntimeError("staged upload is missing its partial chunk")
+                    take = min(chunk_size - partial, len(view))
+                    merged = bytes(tail["data"]) + bytes(view[:take])
+                    await cur.execute(
+                        """
+                        UPDATE vfs_upload_chunks SET data = %s
+                         WHERE upload_id = %s AND chunk_no = %s
+                        """,
+                        (merged, upload_uuid, chunk_no),
+                    )
+                    offset = take
+                    if len(merged) == chunk_size:
+                        chunk_no += 1
+
+                while offset < len(view):
+                    end = min(offset + chunk_size, len(view))
+                    await cur.execute(
+                        """
+                        INSERT INTO vfs_upload_chunks (upload_id, chunk_no, data)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (upload_uuid, chunk_no, bytes(view[offset:end])),
+                    )
+                    chunk_no += 1
+                    offset = end
+
+                await cur.execute(
+                    "UPDATE vfs_uploads SET size = %s WHERE upload_id = %s",
+                    (original_size + len(view), upload_uuid),
                 )
             return True
+
+    async def finish_upload(
+        self,
+        upload_id: UUID | str,
+        size: int | None = None,
+        sha256: str | None = None,
+    ) -> bool:
+        """Atomically publish a staged create, overwrite, or append.
+
+        Overwrite/create publication copies the staged rows with a database-
+        side ``INSERT ... SELECT``. Append publication locks the target node
+        first, so concurrent appenders serialize and each suffix is preserved
+        exactly once in row-lock acquisition order.
+
+        A supplied ``size`` must match the staged byte count. For overwrite
+        uploads fsspec supplies its incrementally computed SHA-256; direct API
+        callers may omit it and the provider scans staged chunks one at a time.
+        Append hashes always scan both existing and staged chunks because hash
+        states cannot be combined from two final digests.
+        """
+        self._require_initialized()
+        upload_uuid = self._coerce_upload_id(upload_id)
+        try:
+            if size is not None and (
+                not isinstance(size, int) or isinstance(size, bool) or size < 0
+            ):
+                raise ValueError("upload size must be a non-negative integer")
+            if sha256 is not None:
+                if not isinstance(sha256, str) or len(sha256) != 64:
+                    raise ValueError("sha256 must be a 64-character hexadecimal string")
+                try:
+                    int(sha256, 16)
+                except ValueError as exc:
+                    raise ValueError(
+                        "sha256 must be a 64-character hexadecimal string"
+                    ) from exc
+                sha256 = sha256.lower()
+
+            async with self._acquire() as conn, self._tx(conn):
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT * FROM vfs_uploads WHERE upload_id = %s FOR UPDATE",
+                        (upload_uuid,),
+                    )
+                    upload = await cur.fetchone()
+                if upload is None:
+                    return False
+
+                async def discard() -> None:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM vfs_uploads WHERE upload_id = %s",
+                            (upload_uuid,),
+                        )
+
+                staged_size = int(upload["size"])
+                if size is not None and size != staged_size:
+                    await discard()
+                    return False
+
+                path = upload["target_path"]
+                row = await self._resolve(conn, path)
+                if row is not None:
+                    row = await self._lock_node(conn, row["node_id"])
+                if row is not None and row["is_dir"]:
+                    await discard()
+                    return False
+                if row is not None and upload["exclusive"]:
+                    await discard()
+                    return False
+
+                created = False
+                if row is None:
+                    parent_row, name = await self._resolve_parent(conn, path)
+                    if parent_row is None or not parent_row["is_dir"]:
+                        await discard()
+                        return False
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO vfs_nodes (parent_id, name, is_dir)
+                            VALUES (%s, %s, false)
+                            ON CONFLICT (parent_id, name) WHERE parent_id IS NOT NULL
+                            DO NOTHING
+                            RETURNING node_id
+                            """,
+                            (parent_row["node_id"], name),
+                        )
+                        inserted = await cur.fetchone()
+                    if inserted is not None:
+                        row = {"node_id": inserted[0]}
+                        created = True
+                    elif upload["exclusive"]:
+                        await discard()
+                        return False
+                    else:
+                        row = await self._child_for_update(
+                            conn, parent_row["node_id"], name
+                        )
+                        if row is None or row["is_dir"]:
+                            await discard()
+                            return False
+
+                assert row is not None
+                node_id = row["node_id"]
+                if upload["append"] and not created:
+                    existing_size = int(row["size"])
+                    final_hash = await self._append_sha256(
+                        conn, node_id, existing_size, upload_uuid, staged_size
+                    )
+                    await self._append_staged_chunks(conn, row, upload)
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE vfs_nodes
+                               SET size = %s, sha256 = %s, modified_at = now()
+                             WHERE node_id = %s
+                            """,
+                            (existing_size + staged_size, final_hash, node_id),
+                        )
+                else:
+                    final_hash = sha256 or await self._staged_sha256(conn, upload_uuid)
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE vfs_nodes
+                               SET size = %s, sha256 = %s, chunk_size = %s,
+                                   modified_at = now()
+                             WHERE node_id = %s
+                            """,
+                            (
+                                staged_size,
+                                final_hash,
+                                upload["chunk_size"],
+                                node_id,
+                            ),
+                        )
+                        await cur.execute(
+                            "DELETE FROM vfs_chunks WHERE node_id = %s", (node_id,)
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO vfs_chunks (node_id, chunk_no, data)
+                            SELECT %s, chunk_no, data
+                              FROM vfs_upload_chunks
+                             WHERE upload_id = %s
+                             ORDER BY chunk_no
+                            """,
+                            (node_id, upload_uuid),
+                        )
+
+                await discard()
+                return True
+        except Exception:
+            # The publish transaction rolls back before this best-effort
+            # cleanup runs, leaving the old target intact. A pool-backed
+            # provider gets a fresh transaction; a joined connection is
+            # cleaned when its caller transaction is still usable.
+            with contextlib.suppress(Exception):
+                await self.abort_upload(upload_uuid)
+            raise
+
+    async def abort_upload(self, upload_id: UUID | str) -> bool:
+        """Immediately discard a staging upload and all of its chunks."""
+        self._require_initialized()
+        upload_uuid = self._coerce_upload_id(upload_id)
+        async with self._acquire() as conn, self._tx(conn), conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM vfs_uploads WHERE upload_id = %s RETURNING upload_id",
+                (upload_uuid,),
+            )
+            return await cur.fetchone() is not None
 
     async def read_file(self, path: str) -> bytes | None:
         """Read a file's complete content; None for missing paths/dirs."""
@@ -877,6 +1344,29 @@ class PostgresStorageProvider(AsyncStorageProvider):
             }
 
     async def cleanup(self) -> dict[str, Any]:
-        """No TTL/expiry support in the current version."""
+        """Remove staging uploads abandoned for more than 24 hours.
+
+        :meth:`abort_upload` is the immediate cleanup path. This TTL sweep is
+        a crash/interruption safety net and never removes visible file nodes.
+        """
         self._require_initialized()
-        return {"files_removed": 0, "bytes_freed": 0, "expired_removed": 0}
+        async with self._acquire() as conn, self._tx(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    WITH expired AS (
+                        DELETE FROM vfs_uploads
+                         WHERE created_at < now() - make_interval(secs => %s)
+                        RETURNING size
+                    )
+                    SELECT COUNT(*), COALESCE(SUM(size), 0) FROM expired
+                    """,
+                    (UPLOAD_TTL_SECONDS,),
+                )
+                row = await cur.fetchone()
+            assert row is not None
+            return {
+                "files_removed": 0,
+                "bytes_freed": row[1],
+                "expired_removed": row[0],
+            }
