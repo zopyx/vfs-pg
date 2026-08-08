@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
+from typing import Any, cast
 from uuid import uuid4
 
 import psycopg
 import pytest
 from chuk_virtual_fs.node_info import EnhancedNodeInfo
 from psycopg import sql
+from psycopg_pool import AsyncConnectionPool
 
 from chuk_vfs_postgres import PostgresStorageProvider
 
@@ -63,7 +65,7 @@ def test_filesystem_id_defaults_and_validation(monkeypatch):
 
     for invalid in ("", "   ", 42):
         with pytest.raises(ValueError, match="non-empty string"):
-            PostgresStorageProvider(filesystem_id=invalid)  # type: ignore[arg-type]
+            PostgresStorageProvider(filesystem_id=invalid)  # ty: ignore[invalid-argument-type]
 
 
 async def test_schema_namespace_indexes_and_default_migration(provider, dsn):
@@ -268,6 +270,21 @@ async def test_double_close_is_safe(provider):
     # provider is usable again after re-initialize
     assert await provider.initialize() is True
     assert await provider.exists("/")
+
+
+async def test_close_swallows_cancelled_pool_shutdown():
+    class CancelledPool:
+        async def close(self) -> None:
+            raise asyncio.CancelledError
+
+    provider = PostgresStorageProvider()
+    provider._initialized = True
+    provider._pool = cast(AsyncConnectionPool[Any], CancelledPool())
+
+    await provider.close()
+
+    assert provider._pool is None
+    assert provider._initialized is False
 
 
 async def test_cleanup_is_noop(provider):
@@ -543,7 +560,7 @@ async def test_invalid_chunk_size_rejected(dsn):
     with pytest.raises(ValueError, match="positive integer"):
         PostgresStorageProvider(dsn=dsn, chunk_size=-5)
     with pytest.raises(ValueError, match="positive integer"):
-        PostgresStorageProvider(dsn=dsn, chunk_size="big")  # type: ignore[arg-type]
+        PostgresStorageProvider(dsn=dsn, chunk_size="big")  # ty: ignore[invalid-argument-type]
 
 
 async def test_chunk_size_is_per_file_self_describing(dsn):
@@ -644,6 +661,7 @@ async def test_move_onto_itself_is_idempotent(provider):
     assert await provider.move_node("/a/f.txt", "/a/f.txt") is True
     assert await provider.read_file("/a/f.txt") == b"x"
     assert await provider.move_node("/a", "/a") is True
+    assert await provider.move_node("/missing", "/missing") is False
 
 
 async def test_move_directory_into_own_subtree_rejected(provider):
@@ -745,6 +763,31 @@ async def test_metadata_json_types(provider):
     assert await provider.get_metadata("/j.txt") == meta
 
 
+async def test_metadata_update_fails_if_node_is_deleted_after_resolution(dsn, monkeypatch):
+    primary = PostgresStorageProvider(dsn=dsn)
+    deleter = PostgresStorageProvider(dsn=dsn)
+    assert await primary.initialize()
+    assert await deleter.initialize()
+    try:
+        assert await primary.write_file_atomic("/gone.bin", b"content")
+        original_resolve = primary._resolve
+        deleted = False
+
+        async def delete_after_resolution(conn, path):
+            nonlocal deleted
+            row = await original_resolve(conn, path)
+            if path == "/gone.bin" and row is not None and not deleted:
+                deleted = True
+                assert await deleter.delete_node(path)
+            return row
+
+        monkeypatch.setattr(primary, "_resolve", delete_after_resolution)
+        assert not await primary.set_metadata("/gone.bin", {"owner": "lost-race"})
+    finally:
+        await primary.close()
+        await deleter.close()
+
+
 # ----------------------------------------------------------------------
 # transaction join (the killer feature)
 # ----------------------------------------------------------------------
@@ -788,6 +831,26 @@ async def test_atomic_transaction_with_business_tables(provider, external_conn):
     finally:
         await external_conn.execute("DROP TABLE IF EXISTS business_docs")
         await external_conn.commit()  # cleanup must persist, not roll back
+
+
+async def test_autocommit_joined_provider_rolls_back_failed_write(dsn, monkeypatch):
+    conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    joined = PostgresStorageProvider(conn=conn)
+    try:
+        assert await joined.initialize()
+        assert await joined.write_file_atomic("/autocommit.bin", b"old")
+
+        async def fail_chunk_insert(*args, **kwargs):
+            raise RuntimeError("simulated chunk insert failure")
+
+        monkeypatch.setattr(joined, "_insert_content_chunks", fail_chunk_insert)
+        with pytest.raises(RuntimeError, match="simulated chunk insert failure"):
+            await joined.write_file_atomic("/autocommit.bin", b"new")
+
+        assert await joined.read_file("/autocommit.bin") == b"old"
+    finally:
+        await joined.close()
+        await conn.close()
 
 
 async def test_duplicate_create_keeps_joined_transaction_usable(provider, external_conn):
@@ -1020,6 +1083,18 @@ async def test_abort_and_failed_finish_leave_target_unchanged(provider):
         assert await cur.fetchone() == (0,)
 
 
+async def test_finish_upload_rejects_incorrect_checksum(provider):
+    assert await provider.write_file_atomic("/checksum.bin", b"old")
+    upload_id = await provider.start_upload("/checksum.bin")
+    assert await provider.upload_part(upload_id, b"new")
+
+    assert not await provider.finish_upload(
+        upload_id, size=3, sha256=hashlib.sha256(b"wrong").hexdigest()
+    )
+    assert await provider.read_file("/checksum.bin") == b"old"
+    assert not await provider.abort_upload(upload_id)
+
+
 async def test_empty_staged_upload_creates_empty_file(provider):
     upload_id = await provider.start_upload("/empty-staged.bin")
     assert await provider.finish_upload(upload_id, size=0, sha256=hashlib.sha256(b"").hexdigest())
@@ -1056,7 +1131,7 @@ async def test_append_rechunks_across_different_provider_chunk_sizes(dsn):
 async def test_failed_upload_part_aborts_session(provider):
     upload_id = await provider.start_upload("/invalid-part.bin")
     with pytest.raises(TypeError, match="bytes-like"):
-        await provider.upload_part(upload_id, "not bytes")  # type: ignore[arg-type]
+        await provider.upload_part(upload_id, "not bytes")
     assert not await provider.exists("/invalid-part.bin")
     assert not await provider.abort_upload(upload_id)
 
@@ -1133,7 +1208,7 @@ def test_provider_path_rejects_nul_and_non_string_values():
     with pytest.raises(ValueError, match="NUL"):
         PostgresStorageProvider._normalize("/bad\x00path")
     with pytest.raises(TypeError, match="path must be a string"):
-        PostgresStorageProvider._normalize(None)  # type: ignore[arg-type]
+        PostgresStorageProvider._normalize(None)  # ty: ignore[invalid-argument-type]
 
 
 # ----------------------------------------------------------------------
@@ -1228,7 +1303,7 @@ async def test_schema_guard_reports_duplicate_siblings():
 
 def test_upload_id_validation_rejects_non_uuid_values():
     with pytest.raises(TypeError, match="UUID or UUID string"):
-        PostgresStorageProvider._coerce_upload_id(42)  # type: ignore[arg-type]
+        PostgresStorageProvider._coerce_upload_id(42)  # ty: ignore[invalid-argument-type]
     with pytest.raises(ValueError, match="badly formed hexadecimal UUID string"):
         PostgresStorageProvider._coerce_upload_id("not-a-uuid")
 

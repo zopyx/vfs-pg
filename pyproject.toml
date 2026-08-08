@@ -3,7 +3,7 @@ name = "vfs-pg"
 version = "0.2.0"
 description = "PostgreSQL storage provider for chuk-virtual-fs with an fsspec adapter (chuk:// protocol)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.15"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
@@ -39,6 +39,9 @@ dependencies = [
 test = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-random-order>=1.1",
+    "pytest-repeat>=0.9.4",
+    "pytest-xdist>=3.7",
     "testcontainers[postgres]>=4.0",
 ]
 docs = [
@@ -58,11 +61,16 @@ chuk = "chuk_fsspec:ChukFileSystem"
 
 [dependency-groups]
 dev = [
+    "nox>=2026.7.11",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=6",
+    "pytest-random-order>=1.1",
+    "pytest-repeat>=0.9.4",
+    "pytest-xdist>=3.7",
     "ruff>=0.14",
     "testcontainers[postgres]>=4.0",
+    "ty>=0.0.69",
 ]
 
 [build-system]

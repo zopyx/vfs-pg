@@ -221,10 +221,10 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 self._initialized = True
                 return True
 
+            assert self.dsn is not None
             pool: AsyncConnectionPool[Any] = AsyncConnectionPool(
                 self.dsn, min_size=self.pool_min, max_size=self.pool_max, open=False
             )
-            assert self.dsn is not None
             self._pool = pool
             try:
                 await pool.open(wait=False, timeout=10)
@@ -257,7 +257,7 @@ class PostgresStorageProvider(AsyncStorageProvider):
                 # including during event-loop teardown. Do not reach into
                 # psycopg_pool internals: connection ownership belongs to its
                 # public close() API.
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await pool.close()
 
     @contextlib.asynccontextmanager
@@ -296,7 +296,13 @@ class PostgresStorageProvider(AsyncStorageProvider):
     @contextlib.asynccontextmanager
     async def _tx(self, conn: AsyncConnection) -> AsyncIterator[None]:
         if self._external_conn is not None:
-            # caller owns the transaction -> join it
+            # Join a caller-managed transaction. An autocommit connection has
+            # no transaction to join, so create one to retain the provider's
+            # all-or-nothing mutation guarantee.
+            if conn.autocommit:
+                async with conn.transaction():
+                    yield
+                return
             yield
             return
         async with conn.transaction():
@@ -762,6 +768,9 @@ class PostgresStorageProvider(AsyncStorageProvider):
             row = await self._resolve(conn, path)
             if row is None:
                 return False
+            row = await self._lock_node(conn, row["node_id"])
+            if row is None:
+                return False
             if row["is_dir"]:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -775,10 +784,14 @@ class PostgresStorageProvider(AsyncStorageProvider):
                         return False
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "DELETE FROM vfs_nodes WHERE filesystem_id = %s AND node_id = %s",
+                    """
+                    DELETE FROM vfs_nodes
+                     WHERE filesystem_id = %s AND node_id = %s
+                    RETURNING node_id
+                    """,
                     (self.filesystem_id, row["node_id"]),
                 )
-            return True
+                return await cur.fetchone() is not None
 
     async def get_node_info(self, path: str) -> EnhancedNodeInfo | None:
         """Return the node's metadata or None when the path does not exist."""
@@ -1171,7 +1184,11 @@ class PostgresStorageProvider(AsyncStorageProvider):
                             ),
                         )
                 else:
-                    final_hash = sha256 or await self._staged_sha256(conn, upload_uuid)
+                    staged_hash = await self._staged_sha256(conn, upload_uuid)
+                    if sha256 is not None and sha256 != staged_hash:
+                        await discard()
+                        return False
+                    final_hash = staged_hash
                     async with conn.cursor() as cur:
                         await cur.execute(
                             """
@@ -1352,16 +1369,20 @@ class PostgresStorageProvider(AsyncStorageProvider):
             row = await self._resolve(conn, path)
             if row is None:
                 return False
+            row = await self._lock_node(conn, row["node_id"])
+            if row is None:
+                return False
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
                         UPDATE vfs_nodes
                            SET metadata = metadata || %s::jsonb, modified_at = now()
                          WHERE filesystem_id = %s AND node_id = %s
-                        """,
+                    RETURNING node_id
+                    """,
                     (Jsonb(metadata), self.filesystem_id, row["node_id"]),
                 )
-            return True
+                return await cur.fetchone() is not None
 
     async def move_node(self, source: str, destination: str) -> bool:
         """Atomic rename/move: a single UPDATE on parent_id + name.
@@ -1378,8 +1399,6 @@ class PostgresStorageProvider(AsyncStorageProvider):
         destination = self._normalize(destination)
         if source == "/" or destination == "/":
             return False
-        if source == destination:
-            return True
 
         async with self._acquire() as conn, self._tx(conn):
             async with conn.cursor() as cur:
@@ -1394,7 +1413,15 @@ class PostgresStorageProvider(AsyncStorageProvider):
             src_row = await self._resolve(conn, source)
             if src_row is None:
                 return False
+            src_row = await self._lock_node(conn, src_row["node_id"])
+            if src_row is None:
+                return False
+            if source == destination:
+                return True
             dest_parent, dest_name = await self._resolve_parent(conn, destination)
+            if dest_parent is None or not dest_parent["is_dir"]:
+                return False
+            dest_parent = await self._lock_node(conn, dest_parent["node_id"])
             if dest_parent is None or not dest_parent["is_dir"]:
                 return False
             if await self._child(conn, dest_parent["node_id"], dest_name):
@@ -1416,7 +1443,8 @@ class PostgresStorageProvider(AsyncStorageProvider):
                                 UPDATE vfs_nodes
                                    SET parent_id = %s, name = %s, modified_at = now()
                                  WHERE filesystem_id = %s AND node_id = %s
-                                """,
+                             RETURNING node_id
+                            """,
                             (
                                 dest_parent["node_id"],
                                 dest_name,
@@ -1424,6 +1452,8 @@ class PostgresStorageProvider(AsyncStorageProvider):
                                 src_row["node_id"],
                             ),
                         )
+                        if await cur.fetchone() is None:
+                            return False
                 except psycopg.errors.UniqueViolation:
                     return False
             return True
@@ -1498,7 +1528,9 @@ class PostgresStorageProvider(AsyncStorageProvider):
                     """,
                     (self.filesystem_id,),
                 )
-                chunk_count = (await cur.fetchone())[0]
+                chunk_row = await cur.fetchone()
+                assert chunk_row is not None  # COUNT(*) always returns a row
+                chunk_count = chunk_row[0]
             return {
                 "total_size_bytes": row[2],
                 "file_count": row[1],

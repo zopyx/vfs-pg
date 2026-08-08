@@ -111,7 +111,7 @@ def test_strip_protocol_rejects_parent_nul_and_non_string_paths():
     with pytest.raises(ValueError, match="NUL"):
         ChukFileSystem._strip_protocol("chuk:///bad\x00path")
     with pytest.raises(TypeError, match="path must be a string"):
-        ChukFileSystem._strip_protocol(42)  # type: ignore[arg-type]
+        ChukFileSystem._strip_protocol(42)  # ty: ignore[no-matching-overload]
 
 
 def test_double_and_triple_slash_urls_address_the_same_file(fs):
@@ -235,6 +235,25 @@ def test_cat_file_range(fs):
     assert fs.cat_file("/big.bin", start=CHUNK + 5) == content[CHUNK + 5 :]
 
 
+def test_cat_file_negative_offsets_match_python_slices(fs):
+    content = b"0123456789"
+    fs.pipe_file("/negative-ranges.bin", content)
+
+    assert fs.cat_file("/negative-ranges.bin", start=-5) == content[-5:]
+    assert fs.cat_file("/negative-ranges.bin", end=-1) == content[:-1]
+    assert fs.cat_file("/negative-ranges.bin", start=-5, end=-1) == content[-5:-1]
+    assert fs.cat_file("/negative-ranges.bin", start=0, end=-1) == content[:-1]
+
+
+def test_pipe_file_create_preserves_existing_content(fs):
+    fs.pipe_file("/create-only.bin", b"original")
+
+    with pytest.raises(FileExistsError):
+        fs.pipe_file("/create-only.bin", b"replacement", mode="create")
+
+    assert fs.cat_file("/create-only.bin") == b"original"
+
+
 def test_open_write_then_read(fs):
     with fs.open("/f.bin", "wb") as f:
         f.write(b"hello ")
@@ -335,6 +354,24 @@ def test_open_exclusive_mode(fs):
         fs.open("/excl.bin", "xb")
 
 
+def test_transaction_discards_writes_after_exception(fs):
+    with pytest.raises(RuntimeError, match="abort transaction"):
+        with fs.transaction:
+            with fs.open("/rolled-back.bin", "wb") as handle:
+                handle.write(b"should not persist")
+            raise RuntimeError("abort transaction")
+
+    assert not fs.exists("/rolled-back.bin")
+
+
+def test_transaction_commits_writes_on_success(fs):
+    with fs.transaction:
+        with fs.open("/committed.bin", "wb") as handle:
+            handle.write(b"persist me")
+
+    assert fs.cat_file("/committed.bin") == b"persist me"
+
+
 def test_open_seek_range_read(fs):
     rng = random.Random(11)
     content = bytes(rng.getrandbits(8) for _ in range(3 * CHUNK))
@@ -355,8 +392,10 @@ def test_open_missing_file_raises(fs):
 
 
 def test_open_unsupported_mode(fs):
-    with pytest.raises(NotImplementedError):
-        fs.open("/x.txt", "r")
+    # Text mode "r" is now supported — it converts to "rb" internally
+    # and wraps with TextIOWrapper. The underlying file still must exist.
+    with pytest.raises(FileNotFoundError):
+        fs.open("/nonexistent.txt", "r")
 
 
 # ----------------------------------------------------------------------
@@ -382,6 +421,22 @@ def test_mkdir_parents_and_rm(fs):
         fs.rm("/a")
 
 
+def test_rm_supports_bulk_paths_and_maxdepth(fs):
+    fs.pipe_file("/bulk/first.bin", b"first")
+    fs.pipe_file("/bulk/second.bin", b"second")
+    fs.rm(["/bulk/first.bin", "/bulk/second.bin"])
+    assert not fs.exists("/bulk/first.bin")
+    assert not fs.exists("/bulk/second.bin")
+
+    fs.pipe_file("/depth/shallow.bin", b"shallow")
+    fs.pipe_file("/depth/deep/leaf.bin", b"deep")
+    with pytest.raises(ValueError, match="non-empty directory"):
+        fs.rm("/depth", recursive=True, maxdepth=1)
+
+    assert not fs.exists("/depth/shallow.bin")
+    assert fs.exists("/depth/deep/leaf.bin")
+
+
 def test_mv(fs):
     fs.pipe_file("/src.txt", b"move me")
     fs.mv("/src.txt", "/dst.txt")  # fsspec mv returns None
@@ -397,6 +452,15 @@ def test_mv_directory_keeps_children(fs):
     fs.mv("/dir", "/renamed", recursive=True)
     assert fs.cat_file("/renamed/f.txt") == b"x"
     assert not fs.exists("/dir")
+
+
+def test_mv_empty_directory_creates_missing_destination_parents(fs):
+    fs.mkdir("/source/empty")
+
+    fs.mv("/source/empty", "/destination/nested/empty", recursive=True)
+
+    assert not fs.exists("/source/empty")
+    assert fs.isdir("/destination/nested/empty")
 
 
 def test_cp(fs):
@@ -924,7 +988,7 @@ def test_buffered_file_streaming_start_part_and_finish_failures(fs, monkeypatch)
 def test_protocol_and_parent_creation_defensive_paths(fs, monkeypatch):
     assert ChukFileSystem._strip_protocol("chuk::nested/file") == "/nested/file"
     with pytest.raises(TypeError, match="path must be a string"):
-        ChukFileSystem._normalize_path(42)  # type: ignore[arg-type]
+        ChukFileSystem._normalize_path(42)  # ty: ignore[invalid-argument-type]
 
     fs.pipe_file("/not-a-directory", b"content")
     with pytest.raises(FileExistsError, match="not a directory"):

@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import os
 import posixpath
-from typing import Any
+from typing import Any, overload
 
 from chuk_virtual_fs.fs_manager import AsyncVirtualFileSystem
-from fsspec.asyn import AsyncFileSystem, sync_wrapper
+from fsspec.asyn import AsyncFileSystem, sync, sync_wrapper
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.spec import AbstractBufferedFile
 from fsspec.utils import isfilelike
@@ -96,20 +97,9 @@ class ChukBufferedFile(AbstractBufferedFile):
                         self._upload_sha256.update(data)
                     self._upload_size += len(data)
                 if final:
-                    digest = (
-                        self._upload_sha256.hexdigest() if self._upload_sha256 is not None else None
-                    )
-                    ok = self.fs.finish_upload(
-                        self.path,
-                        self._upload_id,
-                        size=self._upload_size,
-                        sha256=digest,
-                    )
-                    if not ok:
-                        if "x" in self.mode:
-                            raise FileExistsError(self.path)
-                        raise OSError(f"write failed: {self.path}")
-                    self._upload_id = None
+                    if not self.autocommit:
+                        return
+                    self.commit()
                 return
             except Exception:
                 upload_id, self._upload_id = self._upload_id, None
@@ -124,6 +114,31 @@ class ChukBufferedFile(AbstractBufferedFile):
         parts.append(self.buffer.getvalue())
         if not final:
             return
+        if not self.autocommit:
+            return
+
+        self.commit()
+
+    def commit(self) -> None:
+        """Publish a closed transactional write."""
+        if self._streaming_upload:
+            upload_id = self._upload_id
+            if upload_id is not None:
+                digest = self._upload_sha256.hexdigest() if self._upload_sha256 is not None else None
+                ok = self.fs.finish_upload(
+                    self.path,
+                    upload_id,
+                    size=self._upload_size,
+                    sha256=digest,
+                )
+                if not ok:
+                    if "x" in self.mode:
+                        raise FileExistsError(self.path)
+                    raise OSError(f"write failed: {self.path}")
+                self._upload_id = None
+                return
+
+        parts = getattr(self, "_parts", [])
         content = b"".join(parts)
         self._parts = []
         if self._append:
@@ -137,16 +152,25 @@ class ChukBufferedFile(AbstractBufferedFile):
                 raise FileExistsError(self.path)
             raise OSError(f"write failed: {self.path}")
 
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+    def discard(self) -> None:
+        """Discard a closed transactional write."""
+        if self._streaming_upload:
+            upload_id, self._upload_id = self._upload_id, None
+            if upload_id is not None:
+                self.fs.abort_upload(self.path, upload_id)
+            return
+        self._parts = []
+
+    def __exit__(self, *args: Any) -> None:
         """Discard an in-flight staged upload when the with-block fails."""
-        if exc_type is not None and self.mode != "rb" and self._streaming_upload:
+        if args and args[0] is not None and self.mode != "rb" and self._streaming_upload:
             upload_id, self._upload_id = self._upload_id, None
             if upload_id is not None:
                 with contextlib.suppress(Exception):
                     self.fs.abort_upload(self.path, upload_id)
             self.closed = True
             return None
-        return super().__exit__(exc_type, exc_value, traceback)
+        return super().__exit__(*args)
 
     # reads: default AbstractBufferedFile._fetch_range calls
     # self.fs.cat_file(path, start=start, end=end) -> our async _cat_file
@@ -166,6 +190,55 @@ class ChukFileSystem(AsyncFileSystem):
             raise ValueError("ChukFileSystem requires a chuk AsyncVirtualFileSystem (vfs=...)")
         self.vfs = vfs
 
+    def open(
+        self,
+        path: str,
+        mode: str = "rb",
+        block_size: int | str | None = None,
+        cache_options: dict[str, Any] | None = None,
+        compression: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Open a file while retaining fsspec transaction semantics."""
+        path = self._strip_protocol(path)
+        assert isinstance(path, str)
+        if "b" not in mode:
+            mode = mode.replace("t", "") + "b"
+            text_kwargs = {
+                key: kwargs.pop(key) for key in ("encoding", "errors", "newline") if key in kwargs
+            }
+            return io.TextIOWrapper(
+                self.open(
+                    path,
+                    mode,
+                    block_size=block_size,
+                    cache_options=cache_options,
+                    compression=compression,
+                    **kwargs,
+                ),
+                **text_kwargs,
+            )
+
+        autocommit = kwargs.pop("autocommit", not self._intrans)
+        handle = sync(
+            self.loop,
+            self._open,
+            path,
+            mode=mode,
+            block_size=block_size,
+            autocommit=autocommit,
+            cache_options=cache_options,
+            **kwargs,
+        )
+        if compression is not None:
+            from fsspec.compression import compr
+            from fsspec.core import get_compression
+
+            handle = compr[get_compression(path, compression)](handle, mode=mode[0])
+        if not autocommit and "r" not in mode:
+            self.transaction.files.append(handle)
+        return handle
+
     @classmethod
     def _normalize_path(cls, path: str) -> str:
         """Return the canonical absolute POSIX form of a VFS path."""
@@ -182,6 +255,14 @@ class ChukFileSystem(AsyncFileSystem):
                 raise ValueError("path must not contain '..' components")
             parts.append(part)
         return f"/{'/'.join(parts)}" if parts else "/"
+
+    @overload
+    @classmethod
+    def _strip_protocol(cls, path: str) -> str: ...
+
+    @overload
+    @classmethod
+    def _strip_protocol(cls, path: list[str]) -> list[str]: ...
 
     @classmethod
     def _strip_protocol(cls, path: str | list[str]) -> str | list[str]:
@@ -261,7 +342,20 @@ class ChukFileSystem(AsyncFileSystem):
                 return False
         return True
 
-    async def _rm(self, path: str, recursive: bool = False, **kwargs: Any) -> bool:
+    async def _rm(
+        self,
+        path: str | list[str],
+        recursive: bool = False,
+        batch_size: int | None = None,
+        maxdepth: int | None = None,
+        **kwargs: Any,
+    ) -> bool | list[bool]:
+        is_single_path = isinstance(path, str)
+        paths = await self._expand_path(path, recursive=recursive, maxdepth=maxdepth)
+        results = [await self._rm_file(entry, **kwargs) for entry in reversed(paths)]
+        return all(results) if is_single_path else results
+
+    async def _rm_file(self, path: str, **kwargs: Any) -> bool:
         path = self._strip_protocol(path)
         assert isinstance(path, str)
         node = await self.vfs.get_node_info(path)
@@ -269,10 +363,8 @@ class ChukFileSystem(AsyncFileSystem):
             raise FileNotFoundError(path)
         if node.is_dir:
             children = await self.vfs.ls(path)
-            if children and not recursive:
+            if children:
                 raise ValueError(f"Cannot delete non-empty directory: {path} (use recursive=True)")
-            for name in children:
-                await self._rm(posixpath.join(path, name), recursive=True)
         return bool(await self.vfs.rm(path))
 
     async def _cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
@@ -285,7 +377,10 @@ class ChukFileSystem(AsyncFileSystem):
             raise FileNotFoundError(path1)
         if node.is_dir:
             # recursive copy calls cp_file on the directory itself
-            await self.vfs.mkdir(path2)
+            await self._ensure_parent_directories(path2)
+            created = await self.vfs.mkdir(path2)
+            if not created and not (await self.vfs.exists(path2) and await self.vfs.is_dir(path2)):
+                raise OSError(f"could not create target directory: {path2}")
             return
         data = await self._cat_file(path1)
         await self._pipe_file(path2, data)
@@ -307,6 +402,11 @@ class ChukFileSystem(AsyncFileSystem):
         provider, local = self.vfs._get_provider_for_path(path)
         ranger = getattr(provider, "read_range", None)
         if ranger is not None and (start is not None or end is not None):
+            if (start is not None and start < 0) or (end is not None and end < 0):
+                data = await self.vfs.read_binary(path)
+                if data is None:
+                    raise FileNotFoundError(path)
+                return data[start:end]
             data = await ranger(local, start or 0, end)
             if data is None:
                 raise FileNotFoundError(path)
@@ -393,11 +493,18 @@ class ChukFileSystem(AsyncFileSystem):
         with open(local_path, "wb") as output:  # noqa: ASYNC230
             await export_to(output)
 
-    async def _pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
+    async def _pipe_file(
+        self, path: str, value: bytes, mode: str = "overwrite", **kwargs: Any
+    ) -> None:
         path = self._strip_protocol(path)
         assert isinstance(path, str)
-        ok = await self._commit(path, value, exclusive=False)
+        if mode not in {"overwrite", "create"}:
+            raise ValueError(f"unsupported pipe mode: {mode}")
+        exclusive = mode == "create"
+        ok = await self._commit(path, value, exclusive=exclusive)
         if not ok:
+            if exclusive:
+                raise FileExistsError(path)
             raise OSError(f"write failed: {path}")
 
     async def _ensure_parent_directories(self, path: str) -> None:
@@ -500,6 +607,8 @@ class ChukFileSystem(AsyncFileSystem):
         path: str,
         mode: str = "rb",
         block_size: int | str | None = None,
+        autocommit: bool = True,
+        cache_options: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> ChukBufferedFile:
         path = self._strip_protocol(path)
@@ -522,6 +631,8 @@ class ChukFileSystem(AsyncFileSystem):
             block_size=block_size if block_size is not None else "default",
             size=size,
             details=details,
+            autocommit=autocommit,
+            cache_options=cache_options,
             **kwargs,
         )
 

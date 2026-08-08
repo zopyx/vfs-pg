@@ -11,6 +11,7 @@ existing server instead (the container is then skipped).
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from uuid import uuid4
 
 import psycopg
@@ -38,7 +39,7 @@ def test_filesystem_id():
 
 
 @pytest.fixture(scope="session")
-def postgres_container() -> PostgresContainer | None:
+def postgres_container() -> Iterator[PostgresContainer | None]:
     """A throwaway PostgreSQL server (skipped when VFS_PG_DSN is set)."""
     if os.environ.get("VFS_PG_DSN"):
         yield None

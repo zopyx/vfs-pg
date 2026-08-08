@@ -426,7 +426,9 @@ async def test_concurrent_cross_moves_cannot_disconnect_tree(dsn, monkeypatch):
                     provider.filesystem_id,
                 ),
             )
-            reachable, total = await cur.fetchone()
+            counts = await cur.fetchone()
+            assert counts is not None
+            reachable, total = counts
         assert reachable == total == 5
     finally:
         await provider.close()

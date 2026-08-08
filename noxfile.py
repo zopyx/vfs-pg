@@ -1,4 +1,4 @@
-"""Nox sessions for vfs-pg — test, lint, docs, build across Python 3.12–3.15.
+"""Nox sessions for vfs-pg — test, lint, docs, build across Python 3.12–3.14.
 
 Usage::
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import nox
 
-PYTHON_VERSIONS = ["3.12", "3.13", "3.14", "3.15"]
+PYTHON_VERSIONS = ["3.12", "3.13", "3.14"]
 DEFAULT_PYTHON = "3.12"
 
 nox.options.default_venv_backend = "uv"
@@ -27,13 +27,14 @@ nox.options.stop_on_first_error = True
 # install helpers
 # ---------------------------------------------------------------------------
 
+
 def _install(session: nox.Session, *extras: str) -> None:
     """Install the project with the given extras in editable mode."""
-    extras_str = f"[{','.join(extras)}]" if extras else ""
+    extra_args = tuple(f"--extra={extra}" for extra in extras)
     session.run_install(
         "uv",
         "sync",
-        f"--extra={' --extra '.join(extras)}" if extras else "",
+        *extra_args,
         "--inexact",
         env={"UV_PROJECT_ENVIRONMENT": session.virtualenv.location},
         silent=True,
@@ -68,11 +69,12 @@ def tests(session: nox.Session) -> None:
 
 @nox.session(python=DEFAULT_PYTHON)
 def lint(session: nox.Session) -> None:
-    """Lint with ruff (format + check)."""
+    """Lint and type-check with Ruff and ty."""
     _install(session)
-    session.install("ruff")
+    session.install("ruff", "ty")
     session.run("ruff", "check", ".")
     session.run("ruff", "format", "--check", ".")
+    session.run("ty", "check", "src", "tests")
 
 
 @nox.session(python=DEFAULT_PYTHON)

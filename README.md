@@ -68,7 +68,7 @@ async def main():
     )
     await vfs.initialize()
 
-    fs = fsspec.filesystem("chuk", vfs=vfs)     # sync fsspec API
+    fs = fsspec.filesystem("chuk", vfs=vfs)  # sync fsspec API
     fs.pipe_file("/datasets/data.csv", b"a,b\n1,2\n")
 
     with fs.open("/datasets/data.csv", "rb") as f:
@@ -133,7 +133,7 @@ fallback for providers without staging extensions may buffer complete files.
 
 ```python
 with fs.open("/locks/worker-1", "xb") as f:
-    f.write(b"lease")        # FileExistsError if the path already exists
+    f.write(b"lease")  # FileExistsError if the path already exists
 ```
 
 Of two concurrent exclusive creates, exactly one succeeds — enforced by the
